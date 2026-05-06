@@ -672,6 +672,115 @@ service:
 	assert.Contains(t, result, "# Service configuration")
 }
 
+func TestCollapseYAMLAtPath_UsesNearestLeadingCommentBlock(t *testing.T) {
+	input := `prometheus:
+  prometheusSpec:
+    resources: {}
+    # requests:
+    #   memory: 400Mi
+
+    ## Prometheus StorageSpec for persistent data
+    ## ref: https://example.com/storage
+    ##
+    storageSpec: {}
+`
+	opts := CollapseOptions{MaxDepth: 0, ShowDefaults: true, ShowComments: true}
+
+	result, _, err := CollapseYAMLAtPath([]byte(input), ".prometheus.prometheusSpec.storageSpec", opts)
+
+	require.NoError(t, err)
+	assert.Contains(t, result, "# Prometheus StorageSpec for persistent data")
+	assert.Contains(t, result, "{}")
+	assert.NotContains(t, result, "requests")
+}
+
+func TestExtractNearbyExamples_StorageSpec(t *testing.T) {
+	input := `prometheus:
+  prometheusSpec:
+    ## Prometheus StorageSpec for persistent data
+    storageSpec: {}
+    ## Using PersistentVolumeClaim
+    ##
+    #  volumeClaimTemplate:
+    #    spec:
+    #      storageClassName: ssd
+    #      accessModes: ["ReadWriteOnce"]
+    #      resources:
+    #        requests:
+    #          storage: 50Gi
+    retention: 10d
+`
+
+	examples, err := extractNearbyExamples([]byte(input), ".prometheus.prometheusSpec.storageSpec", 1)
+
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	assert.Equal(t, "high", examples[0].Confidence)
+	assert.Contains(t, examples[0].YAML, "volumeClaimTemplate:")
+	assert.Contains(t, examples[0].YAML, "storage: 50Gi")
+	assert.NotContains(t, examples[0].YAML, "Using PersistentVolumeClaim")
+	assert.NotContains(t, examples[0].YAML, "retention")
+}
+
+func TestExtractNearbyExamples_IgnoresPreviousKeyExample(t *testing.T) {
+	input := `prometheus:
+  prometheusSpec:
+    resources: {}
+    # requests:
+    #   memory: 400Mi
+
+    ## Prometheus StorageSpec for persistent data
+    storageSpec: {}
+    # volumeClaimTemplate:
+    #   spec:
+    #     resources:
+    #       requests:
+    #         storage: 50Gi
+`
+
+	examples, err := extractNearbyExamples([]byte(input), ".prometheus.prometheusSpec.storageSpec", 1)
+
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	assert.Contains(t, examples[0].YAML, "volumeClaimTemplate:")
+	assert.NotContains(t, examples[0].YAML, "memory: 400Mi")
+}
+
+func TestExtractNearbyExamples_RejectsProseContinuation(t *testing.T) {
+	input := `persistence:
+  enabled: false
+  # annotations: {}
+  # existingClaim:
+  # Extra labels to apply to a PVC.
+  size: 10Gi
+`
+
+	examples, err := extractNearbyExamples([]byte(input), ".persistence", 3)
+
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	assert.Equal(t, "annotations: {}", examples[0].YAML)
+	assert.NotContains(t, examples[0].YAML, "existingClaim")
+	assert.NotContains(t, examples[0].YAML, "Extra labels")
+}
+
+func TestExtractNearbyExamples_RejectsSentenceWithColon(t *testing.T) {
+	input := `ports:
+  web:
+    redirectTo: {}
+    # hostPort: 8000
+    # containerPort: 8000
+    # Same sets of parameters: to, scheme, permanent and priority.
+`
+
+	examples, err := extractNearbyExamples([]byte(input), ".ports.web", 3)
+
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	assert.Contains(t, examples[0].YAML, "hostPort: 8000")
+	assert.NotContains(t, examples[0].YAML, "Same sets")
+}
+
 // TestCollapseYAML_RealisticChartSizeBudget generates a Traefik-scale values.yaml
 // (~60KB raw with comments, @schema annotations, deeply nested structures) and
 // verifies that the default collapse settings produce output well under the 40KB
@@ -879,6 +988,16 @@ func TestExtractFirstCommentLine(t *testing.T) {
 		{"blank lines skipped", "#\n#\n# actual content", "actual content"},
 		{"schema then content", "# @schema\n# required: true\n# @schema\n# After schema", "After schema"},
 		{"nested schema props", "# @schema\n# type: object\n# properties:\n#   foo:\n#     type: string\n# @schema\n# -- The real desc", "The real desc"},
+		{
+			name: "previous key example before current docs",
+			input: `# requests:
+#   memory: 400Mi
+#
+# Prometheus StorageSpec for persistent data
+# ref: https://example.com/storage
+#`,
+			expected: "Prometheus StorageSpec for persistent data",
+		},
 	}
 
 	for _, tt := range tests {

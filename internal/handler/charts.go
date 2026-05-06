@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/goccy/go-yaml"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kubedoll-heavy-industries/helm-mcp/internal/mcputil"
@@ -39,22 +38,31 @@ type searchChartsOutput struct {
 }
 
 type getValuesInput struct {
-	RepositoryURL string `json:"repository_url" jsonschema:"Helm repository URL (e.g. https://charts.bitnami.com/bitnami) or OCI registry (e.g. oci://ghcr.io/traefik/helm)"`
-	ChartName     string `json:"chart_name" jsonschema:"Chart name (e.g. postgresql)"`
-	ChartVersion  string `json:"chart_version,omitempty" jsonschema:"Chart version (defaults to latest)"`
-	Path          string `json:"path,omitempty" jsonschema:"YAML path (e.g. .ingress.enabled)"`
-	Depth         *int   `json:"depth,omitempty" jsonschema:"Max nesting depth (default 2, 0 for unlimited)"`
-	MaxArrayItems *int   `json:"max_array_items,omitempty" jsonschema:"Max array items before truncation (default 3, 0 for unlimited)"`
-	ShowComments  *bool  `json:"show_comments,omitempty" jsonschema:"Preserve YAML comments"`
-	ShowDefaults  *bool  `json:"show_defaults,omitempty" jsonschema:"Include default values"`
-	IncludeSchema *bool  `json:"include_schema,omitempty" jsonschema:"Include values.schema.json in response"`
+	RepositoryURL   string `json:"repository_url" jsonschema:"Helm repository URL (e.g. https://charts.bitnami.com/bitnami) or OCI registry (e.g. oci://ghcr.io/traefik/helm)"`
+	ChartName       string `json:"chart_name" jsonschema:"Chart name (e.g. postgresql)"`
+	ChartVersion    string `json:"chart_version,omitempty" jsonschema:"Chart version (defaults to latest)"`
+	Path            string `json:"path,omitempty" jsonschema:"YAML path (e.g. .ingress.enabled)"`
+	Depth           *int   `json:"depth,omitempty" jsonschema:"Max nesting depth (default 2, 0 for unlimited)"`
+	MaxArrayItems   *int   `json:"max_array_items,omitempty" jsonschema:"Max array items before truncation (default 3, 0 for unlimited)"`
+	ShowComments    *bool  `json:"show_comments,omitempty" jsonschema:"Preserve YAML comments"`
+	ShowDefaults    *bool  `json:"show_defaults,omitempty" jsonschema:"Include default values"`
+	IncludeSchema   *bool  `json:"include_schema,omitempty" jsonschema:"Include values.schema.json in response"`
+	IncludeExamples *bool  `json:"include_examples,omitempty" jsonschema:"Include nearby commented YAML examples for the selected path"`
+	ExampleLimit    *int   `json:"example_limit,omitempty" jsonschema:"Maximum nearby examples to include (default 1, max 3)"`
 }
 
 type getValuesOutput struct {
-	Version string `json:"version" jsonschema:"Resolved chart version (especially useful when chart_version was omitted and latest was used)"`
-	Values  string `json:"values" jsonschema:"Values content (YAML)"`
-	Path    string `json:"path,omitempty" jsonschema:"Extracted path, if specified"`
-	Schema  string `json:"schema,omitempty" jsonschema:"JSON Schema for values (if include_schema=true and schema exists)"`
+	Version  string          `json:"version" jsonschema:"Resolved chart version (especially useful when chart_version was omitted and latest was used)"`
+	Values   string          `json:"values" jsonschema:"Values content (YAML)"`
+	Path     string          `json:"path,omitempty" jsonschema:"Extracted path, if specified"`
+	Schema   string          `json:"schema,omitempty" jsonschema:"JSON Schema for values (if include_schema=true and schema exists)"`
+	Examples []valuesExample `json:"examples,omitempty" jsonschema:"Nearby commented YAML examples, if include_examples=true and examples are found"`
+}
+
+type valuesExample struct {
+	YAML       string `json:"yaml" jsonschema:"Example YAML"`
+	Source     string `json:"source" jsonschema:"Where the example was found"`
+	Confidence string `json:"confidence" jsonschema:"Confidence that the commented block is a usable example"`
 }
 
 type getDependenciesInput struct {
@@ -165,6 +173,10 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		repo := strings.TrimSpace(in.RepositoryURL)
 		chart := strings.TrimSpace(in.ChartName)
 		path := strings.TrimSpace(in.Path)
+		includeExamples := in.IncludeExamples != nil && *in.IncludeExamples
+		if includeExamples && path == "" {
+			return mcputil.TextError("include_examples requires path to keep example discovery scoped"), getValuesOutput{}, nil
+		}
 
 		version, err := h.resolveVersion(ctx, repo, chart, in.ChartVersion)
 		if err != nil {
@@ -201,6 +213,9 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		if in.MaxArrayItems != nil && *in.MaxArrayItems < 0 {
 			return mcputil.TextError("max_array_items must be >= 0"), getValuesOutput{}, nil
 		}
+		if in.ExampleLimit != nil && *in.ExampleLimit < 0 {
+			return mcputil.TextError("example_limit must be >= 0"), getValuesOutput{}, nil
+		}
 
 		// Build collapse options from input
 		opts := DefaultCollapseOptions()
@@ -215,20 +230,6 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		}
 		if in.ShowDefaults != nil {
 			opts.ShowDefaults = *in.ShowDefaults
-		}
-
-		// If path is specified, extract that portion first
-		dataToProcess := valuesBytes
-		if path != "" {
-			extracted, extractErr := extractYAMLPath(valuesBytes, path)
-			if extractErr != nil {
-				// Provide actionable error message with chart context
-				if strings.Contains(extractErr.Error(), "path not found") {
-					return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (try depth=1 to see available keys)", path, repo, chart, version)), getValuesOutput{}, nil
-				}
-				return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, extractErr)), getValuesOutput{}, nil
-			}
-			dataToProcess = []byte(extracted)
 		}
 
 		// Fetch schema early so we can account for its size
@@ -249,36 +250,77 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		}
 
 		// Apply collapse transformation, auto-reducing depth if output exceeds limit
-		result, _, err := CollapseYAML(dataToProcess, opts)
+		result, _, err := CollapseYAMLAtPath(valuesBytes, path, opts)
 		if err != nil {
+			// Provide actionable error message with chart context
+			if strings.Contains(err.Error(), "path not found") {
+				return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (try depth=1 to see available keys)", path, repo, chart, version)), getValuesOutput{}, nil
+			}
+			if path != "" {
+				return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
+			}
 			return mcputil.TextError(fmt.Sprintf("processing values: %v", err)), getValuesOutput{}, nil
 		}
 
-		for len(result)+len(schemaStr) > MaxResponseBytes && opts.MaxDepth > 1 {
-			opts.MaxDepth--
-			result, _, err = CollapseYAML(dataToProcess, opts)
+		var examples []valuesExample
+		var examplesText string
+		if includeExamples {
+			limit := defaultExampleLimit
+			if in.ExampleLimit != nil {
+				limit = *in.ExampleLimit
+			}
+			if limit > maxExampleLimit {
+				limit = maxExampleLimit
+			}
+			nearby, err := extractNearbyExamples(valuesBytes, path, limit)
 			if err != nil {
+				if strings.Contains(err.Error(), "path not found") {
+					return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (try depth=1 to see available keys)", path, repo, chart, version)), getValuesOutput{}, nil
+				}
+				return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
+			}
+			examples = make([]valuesExample, 0, len(nearby))
+			for _, example := range nearby {
+				examples = append(examples, valuesExample(example))
+			}
+			examplesText = formatExamplesText(examples)
+		}
+
+		for len(result)+len(schemaStr)+len(examplesText) > MaxResponseBytes && opts.MaxDepth > 1 {
+			opts.MaxDepth--
+			result, _, err = CollapseYAMLAtPath(valuesBytes, path, opts)
+			if err != nil {
+				if strings.Contains(err.Error(), "path not found") {
+					return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (try depth=1 to see available keys)", path, repo, chart, version)), getValuesOutput{}, nil
+				}
+				if path != "" {
+					return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
+				}
 				return mcputil.TextError(fmt.Sprintf("processing values: %v", err)), getValuesOutput{}, nil
 			}
 		}
 
 		// If output still exceeds limit at minimum depth, return an actionable error
-		if len(result)+len(schemaStr) > MaxResponseBytes {
+		if len(result)+len(schemaStr)+len(examplesText) > MaxResponseBytes {
 			return mcputil.TextError(fmt.Sprintf(
 				"values output too large (%d bytes, limit %d) even at depth=%d; use the 'path' parameter to select a subsection (e.g. path=\".ingress\")",
-				len(result)+len(schemaStr), MaxResponseBytes, opts.MaxDepth,
+				len(result)+len(schemaStr)+len(examplesText), MaxResponseBytes, opts.MaxDepth,
 			)), getValuesOutput{}, nil
 		}
 
 		output := getValuesOutput{
-			Version: version,
-			Values:  result,
-			Path:    path,
-			Schema:  schemaStr,
+			Version:  version,
+			Values:   result,
+			Path:     path,
+			Schema:   schemaStr,
+			Examples: examples,
 		}
 
 		// Return raw YAML as text so LLMs read it directly, not wrapped in JSON.
 		textContent := result
+		if examplesText != "" {
+			textContent += examplesText
+		}
 		if schemaStr != "" {
 			textContent += "\n\n--- schema ---\n" + schemaStr
 		}
@@ -287,6 +329,21 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 			Content: []mcp.Content{&mcp.TextContent{Text: textContent}},
 		}, output, nil
 	}
+}
+
+func formatExamplesText(examples []valuesExample) string {
+	if len(examples) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n\n--- examples ---")
+	for i, example := range examples {
+		fmt.Fprintf(&sb, "\n# example %d (%s, %s)\n", i+1, example.Confidence, example.Source)
+		sb.WriteString(strings.TrimSpace(example.YAML))
+		sb.WriteString("\n")
+	}
+	return strings.TrimSuffix(sb.String(), "\n")
 }
 
 func (h *Handler) getDependencies() mcp.ToolHandlerFor[getDependenciesInput, getDependenciesOutput] {
@@ -371,45 +428,4 @@ func (h *Handler) getNotes() mcp.ToolHandlerFor[getNotesInput, getNotesOutput] {
 			Notes:   string(notes),
 		}, nil
 	}
-}
-
-// Helper functions
-
-// extractYAMLPath extracts a value at the given yq-style path from YAML data.
-// Supports paths like ".foo.bar" or ".foo.bar[0]"
-func extractYAMLPath(data []byte, path string) (string, error) {
-	// Handle empty path - return whole document
-	path = strings.TrimPrefix(path, ".")
-	if path == "" {
-		var v any
-		if err := yaml.Unmarshal(data, &v); err != nil {
-			return "", fmt.Errorf("failed to parse YAML: %w", err)
-		}
-		out, err := yaml.Marshal(v)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal result: %w", err)
-		}
-		return strings.TrimSpace(string(out)), nil
-	}
-
-	// Convert yq-style path (.foo.bar[0]) to YAMLPath syntax ($.foo.bar[0])
-	yamlPath := "$." + path
-
-	yp, err := yaml.PathString(yamlPath)
-	if err != nil {
-		return "", fmt.Errorf("invalid path %q: %w", path, err)
-	}
-
-	var result any
-	if err := yp.Read(strings.NewReader(string(data)), &result); err != nil {
-		return "", fmt.Errorf("path not found: %q", path)
-	}
-
-	// Marshal the result back to YAML
-	out, err := yaml.Marshal(result)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal result: %w", err)
-	}
-
-	return strings.TrimSpace(string(out)), nil
 }

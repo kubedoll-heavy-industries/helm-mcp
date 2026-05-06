@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/kubedoll-heavy-industries/helm-mcp/internal/helm"
@@ -558,6 +559,128 @@ client:
 		assert.NotNil(t, result)
 		assert.Contains(t, output.Values, "port: 8080")
 		assert.Contains(t, output.Values, "host: localhost")
+	})
+
+	t.Run("with path extraction preserves comments", func(t *testing.T) {
+		yamlContent := `server:
+  # -- Port exposed by the service
+  port: 8080
+  # -- Hostname clients should use
+  host: localhost
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		showComments := true
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "app",
+			ChartVersion:  "1.0.0",
+			Path:          ".server",
+			ShowComments:  &showComments,
+		})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Contains(t, output.Values, "# Port exposed by the service")
+		assert.Contains(t, output.Values, "port: 8080")
+		assert.Contains(t, output.Values, "# Hostname clients should use")
+		assert.Contains(t, output.Values, "host: localhost")
+	})
+
+	t.Run("with path extraction preserves selected empty object comment", func(t *testing.T) {
+		yamlContent := `prometheus:
+  prometheusSpec:
+    # -- StorageSpec defines persistent storage.
+    # Additional details are intentionally omitted from collapsed comments.
+    storageSpec: {}
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		showComments := true
+		depth := 0
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "app",
+			ChartVersion:  "1.0.0",
+			Path:          ".prometheus.prometheusSpec.storageSpec",
+			Depth:         &depth,
+			ShowComments:  &showComments,
+		})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Contains(t, output.Values, "# StorageSpec defines persistent storage.")
+		assert.Contains(t, output.Values, "{}")
+		assert.NotContains(t, output.Values, "Additional details")
+	})
+
+	t.Run("with path extraction includes nearby examples when requested", func(t *testing.T) {
+		yamlContent := `prometheus:
+  prometheusSpec:
+    # -- StorageSpec defines persistent storage.
+    storageSpec: {}
+    ## Using PersistentVolumeClaim
+    ##
+    # volumeClaimTemplate:
+    #   spec:
+    #     resources:
+    #       requests:
+    #         storage: 50Gi
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		depth := 0
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			Path:            ".prometheus.prometheusSpec.storageSpec",
+			Depth:           &depth,
+			IncludeExamples: &includeExamples,
+		})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		require.Len(t, output.Examples, 1)
+		assert.Contains(t, output.Examples[0].YAML, "volumeClaimTemplate:")
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "--- examples ---")
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "storage: 50Gi")
+	})
+
+	t.Run("include_examples requires path", func(t *testing.T) {
+		mockSvc := new(mocks.ChartService)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		result, _, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			IncludeExamples: &includeExamples,
+		})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.IsError)
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "include_examples requires path")
 	})
 
 	t.Run("with depth limiting", func(t *testing.T) {
