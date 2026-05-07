@@ -663,6 +663,43 @@ client:
 		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "storage: 50Gi")
 	})
 
+	t.Run("example_limit=0 falls back to default", func(t *testing.T) {
+		yamlContent := `prometheus:
+  prometheusSpec:
+    # -- StorageSpec defines persistent storage.
+    storageSpec: {}
+    ## Using PersistentVolumeClaim
+    ##
+    # volumeClaimTemplate:
+    #   spec:
+    #     resources:
+    #       requests:
+    #         storage: 50Gi
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		depth := 0
+		zero := 0
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			Path:            ".prometheus.prometheusSpec.storageSpec",
+			Depth:           &depth,
+			IncludeExamples: &includeExamples,
+			ExampleLimit:    &zero,
+		})
+
+		assert.NoError(t, err)
+		assert.GreaterOrEqual(t, len(output.Examples), 1, "example_limit=0 should fall back to default, not return zero examples")
+	})
+
 	t.Run("include_examples requires path", func(t *testing.T) {
 		mockSvc := new(mocks.ChartService)
 

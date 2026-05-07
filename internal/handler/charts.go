@@ -48,7 +48,7 @@ type getValuesInput struct {
 	ShowDefaults    *bool  `json:"show_defaults,omitempty" jsonschema:"Include default values"`
 	IncludeSchema   *bool  `json:"include_schema,omitempty" jsonschema:"Include values.schema.json in response"`
 	IncludeExamples *bool  `json:"include_examples,omitempty" jsonschema:"Include nearby commented YAML examples for the selected path"`
-	ExampleLimit    *int   `json:"example_limit,omitempty" jsonschema:"Maximum nearby examples to include (default 1, max 3)"`
+	ExampleLimit    *int   `json:"example_limit,omitempty" jsonschema:"Maximum nearby examples to include (default 1, max 3, 0 falls back to default)"`
 }
 
 type getValuesOutput struct {
@@ -266,7 +266,7 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		var examplesText string
 		if includeExamples {
 			limit := defaultExampleLimit
-			if in.ExampleLimit != nil {
+			if in.ExampleLimit != nil && *in.ExampleLimit > 0 {
 				limit = *in.ExampleLimit
 			}
 			if limit > maxExampleLimit {
@@ -274,16 +274,23 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 			}
 			nearby, err := extractNearbyExamples(valuesBytes, path, limit)
 			if err != nil {
-				if strings.Contains(err.Error(), "path not found") {
-					return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (try depth=1 to see available keys)", path, repo, chart, version)), getValuesOutput{}, nil
+				// Path was already validated by CollapseYAMLAtPath above; any error
+				// here is a YAML parse failure in the example extraction. Log and
+				// continue without examples rather than fail the whole request.
+				mcputil.SessionLogError(ctx, req, "Failed to extract nearby examples", map[string]any{
+					"repository": repo,
+					"chart":      chart,
+					"version":    version,
+					"path":       path,
+					"error":      err.Error(),
+				})
+			} else {
+				examples = make([]valuesExample, 0, len(nearby))
+				for _, example := range nearby {
+					examples = append(examples, valuesExample(example))
 				}
-				return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
+				examplesText = formatExamplesText(examples)
 			}
-			examples = make([]valuesExample, 0, len(nearby))
-			for _, example := range nearby {
-				examples = append(examples, valuesExample(example))
-			}
-			examplesText = formatExamplesText(examples)
 		}
 
 		for len(result)+len(schemaStr)+len(examplesText) > MaxResponseBytes && opts.MaxDepth > 1 {
@@ -300,7 +307,14 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 			}
 		}
 
-		// If output still exceeds limit at minimum depth, return an actionable error
+		// If still over budget at minimum depth, drop examples one at a time before
+		// giving up. The user asked for path-scoped values; examples are an extra.
+		for len(result)+len(schemaStr)+len(examplesText) > MaxResponseBytes && len(examples) > 0 {
+			examples = examples[:len(examples)-1]
+			examplesText = formatExamplesText(examples)
+		}
+
+		// If output still exceeds limit, return an actionable error
 		if len(result)+len(schemaStr)+len(examplesText) > MaxResponseBytes {
 			return mcputil.TextError(fmt.Sprintf(
 				"values output too large (%d bytes, limit %d) even at depth=%d; use the 'path' parameter to select a subsection (e.g. path=\".ingress\")",
