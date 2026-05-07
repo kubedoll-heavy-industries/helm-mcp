@@ -1139,3 +1139,46 @@ func TestAstToOrdered_NilMappingValueGuard(t *testing.T) {
 	result := astToOrdered(nil)
 	assert.Nil(t, result)
 }
+
+// TestCollapseYAMLAtPath_ArrayIndex covers the grafana-style sidecar/datasource
+// pattern where charts use array-indexed paths to navigate into list entries.
+func TestCollapseYAMLAtPath_ArrayIndex(t *testing.T) {
+	input := `containers:
+  - name: app
+    image: nginx:1.27
+    ports:
+      - containerPort: 8080
+  - name: sidecar
+    image: redis:7
+    ports:
+      - containerPort: 6379
+`
+	opts := CollapseOptions{MaxDepth: 0, ShowDefaults: true}
+
+	result, _, err := CollapseYAMLAtPath([]byte(input), ".containers[1]", opts)
+	require.NoError(t, err)
+	assert.Contains(t, result, "name: sidecar")
+	assert.Contains(t, result, "redis:7")
+	assert.Contains(t, result, "containerPort: 6379")
+	assert.NotContains(t, result, "name: app", "should select containers[1] only")
+}
+
+// TestExtractNearbyExamples_RealisticProseBlock guards against extracting
+// long-form prose paragraphs (license headers, ref-link sentences) as if
+// they were YAML examples.
+func TestExtractNearbyExamples_RealisticProseBlock(t *testing.T) {
+	input := `service:
+  # This chart is licensed under the Apache 2.0 License.
+  # See https://example.com/license for details.
+  # See also: this is a multi-paragraph note about how the service
+  #   handles upstream timeouts and what fields are involved.
+  enabled: true
+`
+	examples, err := extractNearbyExamples([]byte(input), ".service", 3)
+	require.NoError(t, err)
+	for _, ex := range examples {
+		assert.NotContains(t, ex.YAML, "Apache")
+		assert.NotContains(t, ex.YAML, "license")
+		assert.NotContains(t, ex.YAML, "multi-paragraph")
+	}
+}
