@@ -474,6 +474,14 @@ func exampleCandidatesFromCommentBlock(lines []string) []string {
 
 	var candidates []string
 	for _, part := range splitNonEmptyLineBlocks(cleaned) {
+		// Cap each block before the nested scan. The inner loop calls
+		// yaml.Unmarshal on every (start, end) substring, so an n-line block
+		// triggers up to n*(n+1)/2 parses. Real charts (kube-prometheus-stack,
+		// argo-cd) have multi-hundred-line comment paragraphs that would hang
+		// the request without this cap.
+		if len(part) > maxExampleLines {
+			part = part[:maxExampleLines]
+		}
 		for start := range part {
 			found := false
 			for end := len(part); end > start; end-- {
@@ -587,6 +595,16 @@ func containsProseMappingKey(candidate string) bool {
 		if colon < 0 {
 			continue
 		}
+		// In YAML a key:value pair has the colon followed by whitespace
+		// or end-of-line. A `:` followed by anything else (e.g. `://` in a
+		// URL) isn't a mapping key — skip the line so we don't measure the
+		// "key" half of a URL substring as a prose key.
+		if colon+1 < len(trimmed) {
+			next := trimmed[colon+1]
+			if next != ' ' && next != '\t' {
+				continue
+			}
+		}
 		key := strings.TrimSpace(trimmed[:colon])
 		if key == "" || strings.HasPrefix(key, "\"") || strings.HasPrefix(key, "'") {
 			continue
@@ -609,21 +627,21 @@ func hasValidBlockIndentation(candidate string) bool {
 			continue
 		}
 		indent := leadingSpaces(line)
-		hasChild := false
 		for j := i + 1; j < len(lines); j++ {
 			next := strings.TrimSpace(lines[j])
 			if next == "" {
 				continue
 			}
 			if leadingSpaces(lines[j]) <= indent {
+				// Sibling at the same or lesser indent without an intervening
+				// child means the key was supposed to have content but doesn't.
 				return false
 			}
-			hasChild = true
 			break
 		}
-		if !hasChild {
-			return false
-		}
+		// A trailing `key:` with nothing after is valid YAML (parses as null)
+		// and is a common shape in chart commenting where the key acts as a
+		// placeholder. Don't reject those.
 	}
 	return true
 }
@@ -671,13 +689,18 @@ func isExampleRoot(value interface{}) bool {
 }
 
 func leadingSpaces(line string) int {
+	// YAML forbids tabs in indentation, but free-form comment text (which is
+	// what we measure here) can contain tabs. Treat each tab as 4 spaces — the
+	// most common YAML indent width in the wild. Counting tabs as 1 column
+	// (matching the AST) misaligns against subsequent space-indented siblings;
+	// 4 is closer to typical visual indent without overcounting deeply.
 	count := 0
 	for _, r := range line {
 		switch r {
 		case ' ':
 			count++
 		case '\t':
-			count += 2
+			count += 4
 		default:
 			return count
 		}
@@ -710,7 +733,13 @@ func unquoteKey(key string) string {
 
 // astToOrdered converts an AST node into an ordered tree structure.
 // Maps become *orderedMap, sequences become []interface{}, scalars become Go values.
+// YAML anchors are tracked so aliases resolve to the anchored value rather than
+// rendering as the literal `*name` token.
 func astToOrdered(node ast.Node) interface{} {
+	return astToOrderedWithAnchors(node, map[string]ast.Node{})
+}
+
+func astToOrderedWithAnchors(node ast.Node, anchors map[string]ast.Node) interface{} {
 	if node == nil {
 		return nil
 	}
@@ -719,37 +748,51 @@ func astToOrdered(node ast.Node) interface{} {
 	case *ast.MappingNode:
 		om := &orderedMap{entries: make([]orderedEntry, 0, len(n.Values))}
 		for _, v := range n.Values {
-			if v.Key != nil {
-				om.entries = append(om.entries, orderedEntry{
-					key:   extractKey(v.Key),
-					value: astToOrdered(v.Value),
-				})
+			if v == nil || v.Key == nil {
+				continue
 			}
+			om.entries = append(om.entries, orderedEntry{
+				key:   extractKey(v.Key),
+				value: astToOrderedWithAnchors(v.Value, anchors),
+			})
 		}
 		return om
 
 	case *ast.MappingValueNode:
 		// A single mapping value at the document root
+		if n.Key == nil {
+			return nil
+		}
 		om := &orderedMap{entries: []orderedEntry{{
 			key:   extractKey(n.Key),
-			value: astToOrdered(n.Value),
+			value: astToOrderedWithAnchors(n.Value, anchors),
 		}}}
 		return om
 
 	case *ast.SequenceNode:
 		arr := make([]interface{}, 0, len(n.Values))
 		for _, v := range n.Values {
-			arr = append(arr, astToOrdered(v))
+			arr = append(arr, astToOrderedWithAnchors(v, anchors))
 		}
 		return arr
 
 	case *ast.TagNode:
-		return astToOrdered(n.Value)
+		return astToOrderedWithAnchors(n.Value, anchors)
 
 	case *ast.AnchorNode:
-		return astToOrdered(n.Value)
+		if name := anchorName(n); name != "" && n.Value != nil {
+			anchors[name] = n.Value
+		}
+		return astToOrderedWithAnchors(n.Value, anchors)
 
 	case *ast.AliasNode:
+		if name := aliasName(n); name != "" {
+			if target, ok := anchors[name]; ok {
+				return astToOrderedWithAnchors(target, anchors)
+			}
+		}
+		// Anchor not found (forward reference or malformed YAML): preserve the
+		// raw alias token so the agent can see something rather than nothing.
 		return n.String()
 
 	case *ast.NullNode:
@@ -776,6 +819,28 @@ func astToOrdered(node ast.Node) interface{} {
 	default:
 		return node.String()
 	}
+}
+
+// anchorName extracts the anchor name (without the leading '&') from an AnchorNode.
+func anchorName(n *ast.AnchorNode) string {
+	if n == nil || n.Name == nil {
+		return ""
+	}
+	if s, ok := n.Name.(*ast.StringNode); ok {
+		return s.Value
+	}
+	return strings.TrimPrefix(n.Name.String(), "&")
+}
+
+// aliasName extracts the anchor name (without the leading '*') from an AliasNode.
+func aliasName(n *ast.AliasNode) string {
+	if n == nil || n.Value == nil {
+		return ""
+	}
+	if s, ok := n.Value.(*ast.StringNode); ok {
+		return s.Value
+	}
+	return strings.TrimPrefix(n.String(), "*")
 }
 
 // renderNode renders any YAML node with depth tracking.

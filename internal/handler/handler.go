@@ -37,7 +37,7 @@ func (h *Handler) Register(s *mcp.Server) {
 	// Search for charts in a repository
 	mcputil.RegisterTool(s, mcputil.ToolDef{
 		Name:        "search_charts",
-		Description: "List or search charts in a Helm repository. Provide a repository_url, then optionally filter by keyword (e.g. keyword='postgres'). Note: OCI registries (oci://) do not support browsing; use get_values or get_versions with a specific chart name instead.",
+		Description: "List or search charts in a Helm repository. Provide a repository_url, then optionally filter by keyword (e.g. keyword='postgres'). Note: OCI registries (oci://) do not support browsing — for OCI you must already know the chart name, then call get_versions or get_values directly with that name.",
 		ReadOnly:    true,
 		OpenWorld:   true,
 	}, h.searchCharts())
@@ -45,7 +45,7 @@ func (h *Handler) Register(s *mcp.Server) {
 	// Get chart versions
 	mcputil.RegisterTool(s, mcputil.ToolDef{
 		Name:        "get_versions",
-		Description: "Get available versions of a chart (newest first). Supports both HTTP/HTTPS repos and OCI registries (oci://).",
+		Description: "Get available versions of a chart (newest first). Supports both HTTP/HTTPS repos and OCI registries (oci://). Use this to confirm a chart exists before calling get_values, or to find a specific version to pin.",
 		ReadOnly:    true,
 		OpenWorld:   true,
 	}, h.getVersions())
@@ -53,7 +53,7 @@ func (h *Handler) Register(s *mcp.Server) {
 	// Get chart values with optional schema
 	mcputil.RegisterTool(s, mcputil.ToolDef{
 		Name:        "get_values",
-		Description: "Get chart values.yaml with optional JSON schema. Uses depth limiting (default 2) to show structure without overwhelming context. Use path to drill into specific sections, depth=0 for full YAML. Supports both HTTP/HTTPS repos and OCI registries (oci://).",
+		Description: "Get chart values.yaml with optional JSON schema. Uses depth limiting (default 2) to show structure without overwhelming context. Use path to drill into specific sections, depth=0 for full YAML. include_examples surfaces nearby commented YAML examples and requires path to be set. Supports both HTTP/HTTPS repos and OCI registries (oci://).",
 		ReadOnly:    true,
 		OpenWorld:   true,
 	}, h.getValues())
@@ -61,7 +61,7 @@ func (h *Handler) Register(s *mcp.Server) {
 	// Get chart dependencies
 	mcputil.RegisterTool(s, mcputil.ToolDef{
 		Name:        "get_dependencies",
-		Description: "Get chart dependencies. Supports both HTTP/HTTPS repos and OCI registries (oci://).",
+		Description: "Get chart dependencies (sub-charts). Each dependency entry includes the dependency's repository URL — feed that URL back into search_charts, get_versions, or get_values to inspect the dependency. Supports both HTTP/HTTPS repos and OCI registries (oci://).",
 		ReadOnly:    true,
 		OpenWorld:   true,
 	}, h.getDependencies())

@@ -431,7 +431,7 @@ func ociRefVersioned(validatedURL, chartName, version string) string {
 // ociListVersions lists chart versions from an OCI registry using Tags().
 func (c *Client) ociListVersions(ctx context.Context, repoURL, chartName string) ([]ChartVersion, error) {
 	if c.registryClient == nil {
-		return nil, &RepositoryError{URL: repoURL, Op: "list_versions", Message: "OCI registry client is not available"}
+		return nil, &RepositoryError{URL: repoURL, Op: "get_versions", Message: "OCI registry client is not available"}
 	}
 
 	validatedURL, err := ValidateOCIURL(ctx, repoURL, c.validationOpts())
@@ -448,7 +448,7 @@ func (c *Client) ociListVersions(ctx context.Context, repoURL, chartName string)
 	})
 	defer res.Wait()
 	if res.Err != nil {
-		return nil, &RepositoryError{URL: repoURL, Op: "list_versions", Message: "failed to list OCI tags", Err: res.Err}
+		return nil, &RepositoryError{URL: repoURL, Op: "get_versions", Message: "failed to list OCI tags", Err: res.Err}
 	}
 
 	tags := res.Val

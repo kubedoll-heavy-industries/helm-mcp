@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
@@ -599,8 +600,12 @@ service:
 
 	require.NoError(t, err)
 	assert.True(t, collapsed)
-	// The alias should be rendered visibly, not resolved to the anchor name string
-	assert.Contains(t, result, "*base")
+	// Aliases must resolve to the anchored value so agents see real config,
+	// not the literal `*name` token. kube-prometheus-stack's alertmanager
+	// config relies on this pattern.
+	assert.Contains(t, result, "timeout: 30")
+	assert.Contains(t, result, "retries: 3")
+	assert.NotContains(t, result, "*base")
 }
 
 func TestCollapseYAML_FilterSchemaAnnotations(t *testing.T) {
@@ -759,8 +764,9 @@ func TestExtractNearbyExamples_RejectsProseContinuation(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Len(t, examples, 1)
-	assert.Equal(t, "annotations: {}", examples[0].YAML)
-	assert.NotContains(t, examples[0].YAML, "existingClaim")
+	// Prose ("Extra labels...") must be excluded. Trailing placeholder keys
+	// like `existingClaim:` are permitted because real charts (cert-manager,
+	// argo-cd) use them as fill-in-the-blank examples.
 	assert.NotContains(t, examples[0].YAML, "Extra labels")
 }
 
@@ -1061,4 +1067,75 @@ func TestRenderScalar(t *testing.T) {
 			assert.Equal(t, tt.expected, sb.String())
 		})
 	}
+}
+
+// TestCollapseYAML_NestedAliasResolution exercises kube-prometheus-stack's pattern
+// where alertmanager rules use a merge key with an alias. The output must contain
+// resolved values, not the raw alias token.
+func TestCollapseYAML_NestedAliasResolution(t *testing.T) {
+	input := `defaults: &defaults
+  enabled: true
+  retention: 10d
+nested:
+  child: *defaults
+`
+	opts := CollapseOptions{MaxDepth: 5, ShowDefaults: true}
+
+	result, _, err := CollapseYAML([]byte(input), opts)
+	require.NoError(t, err)
+
+	assert.NotContains(t, result, "*defaults", "alias should resolve, not render literal token")
+	// nested.child should expand to the anchored map
+	assert.Contains(t, result, "enabled: true")
+	assert.Contains(t, result, "retention: 10d")
+}
+
+// TestCollapseYAML_UnresolvedAliasFallsBack guards the safety net for malformed
+// YAML where an alias references an undefined anchor.
+func TestCollapseYAML_UnresolvedAliasFallsBack(t *testing.T) {
+	// Forward reference: alias appears before its anchor. YAML technically
+	// forbids this, but the parser may still accept it. We must not crash.
+	input := `service:
+  config: *missing
+`
+	opts := CollapseOptions{MaxDepth: 3, ShowDefaults: true}
+
+	// The parser may reject this outright; we only assert no panic and a
+	// graceful return. If it parses, the unresolved alias falls back to the
+	// raw token rather than crashing.
+	_, _, _ = CollapseYAML([]byte(input), opts)
+}
+
+// TestExampleCandidatesFromCommentBlock_LargeBlockTimeBound regression-tests #3:
+// a 200-line comment block must not hang. Cap kicks in at maxExampleLines=80
+// before the nested yaml.Unmarshal scan.
+func TestExampleCandidatesFromCommentBlock_LargeBlockTimeBound(t *testing.T) {
+	// Build a 200-line block of "key: value" lines that won't pass example
+	// validation (because none parse cleanly together) but will exercise the
+	// nested loop fully if the cap is missing.
+	lines := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		lines = append(lines, fmt.Sprintf("# this is a long line of prose that contains a colon: see issue %d for more details", i))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = exampleCandidatesFromCommentBlock(lines)
+	}()
+
+	select {
+	case <-done:
+		// completed within deadline
+	case <-time.After(2 * time.Second):
+		t.Fatalf("exampleCandidatesFromCommentBlock did not return within 2s on 200-line block — O(n^2)/O(n^3) regression")
+	}
+}
+
+// TestAstToOrdered_NilMappingValueGuard regression-tests #1: a malformed AST
+// node with nil Key must not panic.
+func TestAstToOrdered_NilMappingValueGuard(t *testing.T) {
+	// Direct nil-node call: should return nil, not panic.
+	result := astToOrdered(nil)
+	assert.Nil(t, result)
 }

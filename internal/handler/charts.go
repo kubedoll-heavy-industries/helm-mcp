@@ -47,16 +47,17 @@ type getValuesInput struct {
 	ShowComments    *bool  `json:"show_comments,omitempty" jsonschema:"Preserve YAML comments"`
 	ShowDefaults    *bool  `json:"show_defaults,omitempty" jsonschema:"Include default values"`
 	IncludeSchema   *bool  `json:"include_schema,omitempty" jsonschema:"Include values.schema.json in response"`
-	IncludeExamples *bool  `json:"include_examples,omitempty" jsonschema:"Include nearby commented YAML examples for the selected path"`
+	IncludeExamples *bool  `json:"include_examples,omitempty" jsonschema:"Include nearby commented YAML examples for the selected path (requires path to be set)"`
 	ExampleLimit    *int   `json:"example_limit,omitempty" jsonschema:"Maximum nearby examples to include (default 1, max 3, 0 falls back to default)"`
 }
 
 type getValuesOutput struct {
-	Version  string          `json:"version" jsonschema:"Resolved chart version (especially useful when chart_version was omitted and latest was used)"`
-	Values   string          `json:"values" jsonschema:"Values content (YAML)"`
-	Path     string          `json:"path,omitempty" jsonschema:"Extracted path, if specified"`
-	Schema   string          `json:"schema,omitempty" jsonschema:"JSON Schema for values (if include_schema=true and schema exists)"`
-	Examples []valuesExample `json:"examples,omitempty" jsonschema:"Nearby commented YAML examples, if include_examples=true and examples are found"`
+	Version       string          `json:"version" jsonschema:"Resolved chart version (especially useful when chart_version was omitted and latest was used)"`
+	Values        string          `json:"values" jsonschema:"Values content (YAML)"`
+	Path          string          `json:"path,omitempty" jsonschema:"Extracted path, if specified"`
+	Schema        string          `json:"schema,omitempty" jsonschema:"JSON Schema for values (if include_schema=true and schema exists)"`
+	SchemaWarning string          `json:"schema_warning,omitempty" jsonschema:"Set when include_schema=true but the schema could not be retrieved; absence of this field with empty schema means the chart has no schema"`
+	Examples      []valuesExample `json:"examples,omitempty" jsonschema:"Nearby commented YAML examples, if include_examples=true and examples are found"`
 }
 
 type valuesExample struct {
@@ -233,7 +234,7 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		}
 
 		// Fetch schema early so we can account for its size
-		var schemaStr string
+		var schemaStr, schemaWarning string
 		if in.IncludeSchema != nil && *in.IncludeSchema {
 			schema, present, schemaErr := h.svc.GetValuesSchema(ctx, repo, chart, version)
 			if schemaErr != nil {
@@ -243,7 +244,10 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 					"version":    version,
 					"error":      schemaErr.Error(),
 				})
-				// Don't fail the whole request, schema just won't be included
+				// Surface the failure to the agent so they can distinguish "no
+				// schema available" from "fetch failed" — without failing the
+				// whole request.
+				schemaWarning = fmt.Sprintf("schema fetch failed: %v", schemaErr)
 			} else if present {
 				schemaStr = string(schema)
 			}
@@ -254,7 +258,7 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		if err != nil {
 			// Provide actionable error message with chart context
 			if strings.Contains(err.Error(), "path not found") {
-				return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (try depth=1 to see available keys)", path, repo, chart, version)), getValuesOutput{}, nil
+				return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (call get_values without 'path' and with depth=1 to see available top-level keys)", path, repo, chart, version)), getValuesOutput{}, nil
 			}
 			if path != "" {
 				return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
@@ -298,7 +302,7 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 			result, _, err = CollapseYAMLAtPath(valuesBytes, path, opts)
 			if err != nil {
 				if strings.Contains(err.Error(), "path not found") {
-					return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (try depth=1 to see available keys)", path, repo, chart, version)), getValuesOutput{}, nil
+					return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (call get_values without 'path' and with depth=1 to see available top-level keys)", path, repo, chart, version)), getValuesOutput{}, nil
 				}
 				if path != "" {
 					return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
@@ -323,11 +327,12 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		}
 
 		output := getValuesOutput{
-			Version:  version,
-			Values:   result,
-			Path:     path,
-			Schema:   schemaStr,
-			Examples: examples,
+			Version:       version,
+			Values:        result,
+			Path:          path,
+			Schema:        schemaStr,
+			SchemaWarning: schemaWarning,
+			Examples:      examples,
 		}
 
 		// Return raw YAML as text so LLMs read it directly, not wrapped in JSON.
@@ -337,6 +342,8 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		}
 		if schemaStr != "" {
 			textContent += "\n\n--- schema ---\n" + schemaStr
+		} else if schemaWarning != "" {
+			textContent += "\n\n--- schema ---\n# " + schemaWarning
 		}
 
 		return &mcp.CallToolResult{
@@ -432,8 +439,8 @@ func (h *Handler) getNotes() mcp.ToolHandlerFor[getNotesInput, getNotesOutput] {
 		// Guard against responses that would overwhelm LLM context
 		if len(notes) > MaxResponseBytes {
 			return mcputil.TextError(fmt.Sprintf(
-				"NOTES.txt too large (%d bytes, limit %d)",
-				len(notes), MaxResponseBytes,
+				"NOTES.txt for %s/%s@%s is too large (%d bytes, limit %d). NOTES.txt is rendered as a single document and has no subsection parameter — fetch the chart locally with `helm pull` if you need the full content.",
+				repo, chart, version, len(notes), MaxResponseBytes,
 			)), getNotesOutput{}, nil
 		}
 

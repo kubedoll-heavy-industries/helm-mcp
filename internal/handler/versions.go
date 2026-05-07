@@ -54,7 +54,7 @@ func (h *Handler) getVersions() mcp.ToolHandlerFor[getVersionsInput, getVersions
 
 		versions, err := h.svc.ListVersions(ctx, repo, chart)
 		if err != nil {
-			return mcputil.HandleOpError("list_versions", repo, chart, "", err), emptyOutput, nil
+			return mcputil.HandleOpError("get_versions", repo, chart, "", err), emptyOutput, nil
 		}
 
 		total := len(versions)
