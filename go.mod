@@ -9,7 +9,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.6.0
 	github.com/spf13/pflag v1.0.10
 	github.com/stretchr/testify v1.11.1
-	go.uber.org/zap v1.27.1
+	go.uber.org/zap v1.28.0
 	helm.sh/helm/v4 v4.1.4
 )
 
