@@ -1113,6 +1113,122 @@ ingress:
 		assert.Contains(t, output.Values, "ingress:")
 	})
 
+	t.Run("parse failure degrades to raw values with parse_warning", func(t *testing.T) {
+		// Reproducer for argo-cd's chart pattern: empty literal block scalar +
+		// blank line + same-indent comment + sibling key. goccy/go-yaml has a
+		// bug here (see ../../docs/.. or upstream issue). The handler must
+		// degrade gracefully instead of returning an error.
+		problematic := []byte("affinity: |\n\n# -- comment\ntolerations: []\n")
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "argocd", "1.0.0").
+			Return(problematic, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "argocd",
+			ChartVersion:  "1.0.0",
+		})
+
+		assert.NoError(t, err)
+		require.NotNil(t, result)
+		assert.False(t, result.IsError, "parse failure must not return an error result")
+		assert.NotEmpty(t, output.ParseWarning, "agent must be told the parser failed")
+		assert.Contains(t, output.Values, "affinity", "raw values must be returned so the agent has the data")
+		assert.Contains(t, output.Values, "tolerations", "raw values must include the sibling key")
+		// Text content should also surface the warning.
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "parse_warning")
+	})
+
+	t.Run("parse failure warning is a single line, not a code frame", func(t *testing.T) {
+		problematic := []byte("affinity: |\n\n# -- comment\ntolerations: []\n")
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "argocd", "1.0.0").
+			Return(problematic, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "argocd",
+			ChartVersion:  "1.0.0",
+		})
+
+		assert.NoError(t, err)
+		assert.NotEmpty(t, output.ParseWarning)
+		// Multi-line code frames bloat the warning and confuse agents that
+		// surface tool errors verbatim.
+		assert.NotContains(t, output.ParseWarning, "\n", "warning must be a single line")
+		// Sanity: still contains the parser's location info so the agent
+		// (or a developer reading logs) can find the offending line.
+		assert.Regexp(t, `\[\d+:\d+\]`, output.ParseWarning)
+	})
+
+	t.Run("parse failure truncation respects line boundaries", func(t *testing.T) {
+		// Build a huge YAML that won't parse and exceeds the budget, with
+		// line-aligned content so we can detect mid-line truncation.
+		var sb strings.Builder
+		sb.WriteString("affinity: |\n\n# unparseable\n")
+		for i := 0; i < 5000; i++ {
+			fmt.Fprintf(&sb, "key_%05d: value_with_some_meaningful_payload_to_take_bytes_%d\n", i, i)
+		}
+		problematic := []byte(sb.String())
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "argocd", "1.0.0").
+			Return(problematic, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "argocd",
+			ChartVersion:  "1.0.0",
+		})
+
+		assert.NoError(t, err)
+		require.NotEmpty(t, output.ParseWarning)
+		require.Contains(t, output.Values, "...truncated", "output must be truncated for this large input")
+
+		// The line immediately before the truncation marker should be a
+		// complete `key_NNNNN: value_...` line, not a half-key like "key_0".
+		idx := strings.Index(output.Values, "\n# ...truncated")
+		require.Greater(t, idx, 0)
+		lastNewline := strings.LastIndexByte(output.Values[:idx], '\n')
+		require.Greater(t, lastNewline, -1)
+		lastLine := output.Values[lastNewline+1 : idx]
+		assert.Regexp(t, `^key_\d{5}: value_with_some_meaningful_payload_to_take_bytes_\d+$`, lastLine,
+			"truncation must round down to a complete line")
+	})
+
+	t.Run("parse failure with path returns raw and explains path was not applied", func(t *testing.T) {
+		problematic := []byte("affinity: |\n\n# -- comment\ntolerations: []\n")
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "argocd", "1.0.0").
+			Return(problematic, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "argocd",
+			ChartVersion:  "1.0.0",
+			Path:          ".tolerations",
+		})
+
+		assert.NoError(t, err)
+		assert.NotEmpty(t, output.ParseWarning)
+		assert.Contains(t, output.ParseWarning, ".tolerations", "warning should name the path that was not applied")
+	})
+
 	t.Run("budget trim drops examples before erroring", func(t *testing.T) {
 		// Construct a values doc where the values fit comfortably but the
 		// examples (commented siblings) push over budget. The handler should

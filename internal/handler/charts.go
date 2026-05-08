@@ -57,6 +57,7 @@ type getValuesOutput struct {
 	Path          string          `json:"path,omitempty" jsonschema:"Extracted path, if specified"`
 	Schema        string          `json:"schema,omitempty" jsonschema:"JSON Schema for values (if include_schema=true and schema exists)"`
 	SchemaWarning string          `json:"schema_warning,omitempty" jsonschema:"Set when include_schema=true but the schema could not be retrieved; absence of this field with empty schema means the chart has no schema"`
+	ParseWarning  string          `json:"parse_warning,omitempty" jsonschema:"Set when the YAML parser failed on this chart's values.yaml. The 'values' field then contains raw bytes (possibly truncated) and path/depth/include_examples/include_schema were not applied"`
 	Examples      []valuesExample `json:"examples,omitempty" jsonschema:"Nearby commented YAML examples, if include_examples=true and examples are found"`
 }
 
@@ -256,9 +257,40 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		// Apply collapse transformation, auto-reducing depth if output exceeds limit
 		result, _, err := CollapseYAMLAtPath(valuesBytes, path, opts)
 		if err != nil {
-			// Provide actionable error message with chart context
+			// "path not found" is a fully classified error — don't degrade.
 			if strings.Contains(err.Error(), "path not found") {
 				return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (call get_values without 'path' and with depth=1 to see available top-level keys)", path, repo, chart, version)), getValuesOutput{}, nil
+			}
+			// YAML parse failures (e.g. argo-cd's empty literal-block-scalar +
+			// comment pattern hits a goccy/go-yaml bug) used to fail the whole
+			// request. Fall back to returning the raw values so the agent still
+			// gets the chart's data, with a parse_warning explaining why
+			// path/depth/include_examples couldn't be applied.
+			if isYAMLParseError(err) {
+				mcputil.SessionLogError(ctx, req, "YAML parse failed; returning raw values", map[string]any{
+					"repository": repo,
+					"chart":      chart,
+					"version":    version,
+					"path":       path,
+					"error":      err.Error(),
+				})
+				rawValues, parseWarning := fallbackRawValues(valuesBytes, path, len(schemaStr), err)
+				output := getValuesOutput{
+					Version:       version,
+					Values:        rawValues,
+					Path:          path,
+					Schema:        schemaStr,
+					SchemaWarning: schemaWarning,
+					ParseWarning:  parseWarning,
+				}
+				textContent := rawValues
+				if schemaStr != "" {
+					textContent += "\n\n--- schema ---\n" + schemaStr
+				}
+				textContent += "\n\n--- parse_warning ---\n# " + parseWarning
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: textContent}},
+				}, output, nil
 			}
 			if path != "" {
 				return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
@@ -365,6 +397,75 @@ func formatExamplesText(examples []valuesExample) string {
 		sb.WriteString("\n")
 	}
 	return strings.TrimSuffix(sb.String(), "\n")
+}
+
+// isYAMLParseError tells us whether the error from CollapseYAMLAtPath /
+// CollapseYAML originated in the YAML parser. The wrappers prefix parse
+// failures with "parsing YAML:".
+func isYAMLParseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "parsing YAML")
+}
+
+// fallbackRawValues prepares a raw-values response when the YAML AST parser
+// failed. It returns the raw bytes (truncated at a line boundary within budget
+// headroom) and a one-line warning. path/depth/include_examples cannot be
+// honored without an AST, so the caller should not attempt them when this is
+// invoked.
+func fallbackRawValues(values []byte, path string, schemaSize int, parseErr error) (string, string) {
+	summary := summarizeYAMLParseError(parseErr)
+	var warning string
+	if path != "" {
+		warning = fmt.Sprintf(
+			"YAML parser failed (%s); returning raw values without applying path=%q, depth, include_examples, or include_schema. Search the raw values for the section you need.",
+			summary, path,
+		)
+	} else {
+		warning = fmt.Sprintf(
+			"YAML parser failed (%s); returning raw values without applying depth, include_examples, or include_schema.",
+			summary,
+		)
+	}
+
+	// Reserve room for the warning, schema (if any), and the headers we
+	// concatenate around them. 256 bytes of headroom is enough for the
+	// "--- parse_warning ---" / "--- schema ---" markers.
+	const headerOverhead = 256
+	available := MaxResponseBytes - schemaSize - len(warning) - headerOverhead
+	if available < 0 {
+		available = 0
+	}
+
+	raw := string(values)
+	if len(raw) > available {
+		// Round down to a line boundary so the agent doesn't see a key cut in
+		// half (e.g. "containerPorts.m\n# ...truncated...").
+		cut := available
+		if nl := strings.LastIndexByte(raw[:cut], '\n'); nl > 0 {
+			cut = nl
+		}
+		raw = raw[:cut] + "\n# ...truncated due to response budget; raw output is unparseable so depth/path/example controls do not apply...\n"
+	}
+	return raw, warning
+}
+
+// summarizeYAMLParseError reduces a goccy/go-yaml parse error to a single
+// line. The default formatting includes a multi-line code frame with line
+// numbers and a caret, which is useful in a developer log but noisy in a
+// machine-readable response field.
+func summarizeYAMLParseError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	// The first line typically reads: "parsing YAML: [LINE:COL] description"
+	// followed by the code frame. Drop everything after the first newline.
+	if nl := strings.IndexByte(msg, '\n'); nl > 0 {
+		msg = msg[:nl]
+	}
+	return strings.TrimSpace(msg)
 }
 
 func (h *Handler) getDependencies() mcp.ToolHandlerFor[getDependenciesInput, getDependenciesOutput] {
