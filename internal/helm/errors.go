@@ -21,10 +21,14 @@ type ChartNotFoundError struct {
 }
 
 func (e *ChartNotFoundError) Error() string {
+	// The repository URL is intentionally omitted: callers route this through
+	// mcputil.OperationError, which already formats "op: repo/chart" — including
+	// the repo here would duplicate it in agent-visible messages. Programmatic
+	// consumers can read e.Repository directly via errors.As.
 	if e.Version == "" {
-		return fmt.Sprintf("chart %q not found in repository %q", e.Chart, e.Repository)
+		return fmt.Sprintf("chart %q not found", e.Chart)
 	}
-	return fmt.Sprintf("chart %q version %q not found in repository %q", e.Chart, e.Version, e.Repository)
+	return fmt.Sprintf("chart %q version %q not found", e.Chart, e.Version)
 }
 
 // Is implements errors.Is for ChartNotFoundError.
@@ -41,10 +45,14 @@ type RepositoryError struct {
 }
 
 func (e *RepositoryError) Error() string {
+	// The repository URL is intentionally omitted: callers route this through
+	// mcputil.OperationError, which already formats "op: repo[...]" — including
+	// the URL here would duplicate it in agent-visible messages. Programmatic
+	// consumers can read e.URL directly via errors.As.
 	if e.Err != nil {
-		return fmt.Sprintf("repository %q: %s: %s: %v", e.URL, e.Op, e.Message, e.Err)
+		return fmt.Sprintf("%s: %s: %v", e.Op, e.Message, e.Err)
 	}
-	return fmt.Sprintf("repository %q: %s: %s", e.URL, e.Op, e.Message)
+	return fmt.Sprintf("%s: %s", e.Op, e.Message)
 }
 
 func (e *RepositoryError) Unwrap() error {
@@ -78,7 +86,9 @@ type URLValidationError struct {
 }
 
 func (e *URLValidationError) Error() string {
-	return fmt.Sprintf("URL %q: %s", e.URL, e.Reason)
+	// URL intentionally not included; the outer mcputil.OperationError carries
+	// it. URL field remains for programmatic access via errors.As.
+	return e.Reason
 }
 
 // Is implements errors.Is for URLValidationError.

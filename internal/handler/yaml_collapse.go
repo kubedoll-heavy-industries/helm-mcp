@@ -908,7 +908,7 @@ func renderArrayItem(sb *strings.Builder, item interface{}, path string, indent 
 	switch v := item.(type) {
 	case *orderedMap:
 		if len(v.entries) == 0 {
-			sb.WriteString("object (empty)\n")
+			sb.WriteString("{}\n")
 			return
 		}
 		if depth >= opts.MaxDepth {
@@ -920,7 +920,7 @@ func renderArrayItem(sb *strings.Builder, item interface{}, path string, indent 
 
 	case []interface{}:
 		if len(v) == 0 {
-			sb.WriteString("array (empty)\n")
+			sb.WriteString("[]\n")
 			return
 		}
 		if depth >= opts.MaxDepth {
@@ -965,7 +965,7 @@ func renderValue(sb *strings.Builder, value interface{}, path string, indent str
 	switch v := value.(type) {
 	case *orderedMap:
 		if len(v.entries) == 0 {
-			sb.WriteString("object (empty)\n")
+			sb.WriteString("{}\n")
 			return
 		}
 		if depth >= opts.MaxDepth {
@@ -978,7 +978,7 @@ func renderValue(sb *strings.Builder, value interface{}, path string, indent str
 
 	case []interface{}:
 		if len(v) == 0 {
-			sb.WriteString("array (empty)\n")
+			sb.WriteString("[]\n")
 			return
 		}
 		if depth >= opts.MaxDepth {
@@ -1005,10 +1005,12 @@ func renderScalar(sb *strings.Builder, v interface{}, showDefaults bool) {
 }
 
 // summarizeOrderedMap returns a type summary for an ordered map.
+// Empty maps render as literal "{}" so the agent can tell at a glance the map
+// is actually empty rather than collapsed-with-hidden-content.
 func summarizeOrderedMap(m *orderedMap) string {
 	switch len(m.entries) {
 	case 0:
-		return "object (empty)"
+		return "{}"
 	case 1:
 		return "object (1 key)"
 	default:
@@ -1017,10 +1019,12 @@ func summarizeOrderedMap(m *orderedMap) string {
 }
 
 // summarizeArray returns a summary for an array.
+// Empty arrays render as literal "[]" so the agent can tell at a glance the
+// array is actually empty rather than truncated.
 func summarizeArray(arr []interface{}) string {
 	switch len(arr) {
 	case 0:
-		return "array (empty)"
+		return "[]"
 	case 1:
 		return "array (1 item)"
 	default:

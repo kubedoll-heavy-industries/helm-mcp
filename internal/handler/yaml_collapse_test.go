@@ -91,8 +91,8 @@ labels: {}
 
 	require.NoError(t, err)
 	assert.True(t, collapsed)
-	assert.Contains(t, result, "annotations: object (empty)")
-	assert.Contains(t, result, "labels: object (empty)")
+	assert.Contains(t, result, "annotations: {}")
+	assert.Contains(t, result, "labels: {}")
 }
 
 func TestCollapseYAML_ArraySummarized(t *testing.T) {
@@ -109,7 +109,7 @@ volumes: []
 	require.NoError(t, err)
 	assert.True(t, collapsed)
 	assert.Contains(t, result, "ports: array (3 items)")
-	assert.Contains(t, result, "volumes: array (empty)")
+	assert.Contains(t, result, "volumes: []")
 }
 
 func TestCollapseYAML_ArrayTruncation(t *testing.T) {
@@ -473,7 +473,7 @@ func TestSummarizeOrderedMap(t *testing.T) {
 		input    *orderedMap
 		expected string
 	}{
-		{"empty", &orderedMap{}, "object (empty)"},
+		{"empty", &orderedMap{}, "{}"},
 		{"one key", &orderedMap{entries: []orderedEntry{{key: "a", value: 1}}}, "object (1 key)"},
 		{"multiple keys", &orderedMap{entries: []orderedEntry{{key: "a", value: 1}, {key: "b", value: 2}, {key: "c", value: 3}}}, "object (3 keys)"},
 	}
@@ -491,7 +491,7 @@ func TestSummarizeArray(t *testing.T) {
 		input    []interface{}
 		expected string
 	}{
-		{"empty", []interface{}{}, "array (empty)"},
+		{"empty", []interface{}{}, "[]"},
 		{"one item", []interface{}{1}, "array (1 item)"},
 		{"multiple items", []interface{}{1, 2, 3}, "array (3 items)"},
 	}
