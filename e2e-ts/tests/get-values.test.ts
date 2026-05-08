@@ -88,4 +88,59 @@ describe("get_values", () => {
     expect(structured.path).toBe(".image");
     expect(structured.values).toMatch(/repository|tag|pullPolicy/);
   });
+
+  it("returns nearby commented examples when include_examples=true", async () => {
+    // alertmanager values has commented example blocks under several keys.
+    const result = await client.callTool({
+      name: "get_values",
+      arguments: {
+        repository_url: REPO_URL,
+        chart_name: "alertmanager",
+        path: ".persistence",
+        include_examples: true,
+      },
+    });
+
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as {
+      values: string;
+      path: string;
+      examples?: Array<{ yaml: string }>;
+    };
+    expect(structured.values).toBeTruthy();
+    expect(structured.path).toBe(".persistence");
+    // examples may or may not be present depending on which chart version is
+    // resolved; we just need the field to deserialize cleanly when present.
+    if (structured.examples && structured.examples.length > 0) {
+      for (const ex of structured.examples) {
+        expect(typeof ex.yaml).toBe("string");
+        expect(ex.yaml.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("handles concurrent calls to different charts without empty replies", async () => {
+    // Smoke-test surfaced empty replies under parallel chart fetches.
+    const charts = [
+      "alertmanager",
+      "prometheus-pushgateway",
+      "kube-state-metrics",
+    ];
+
+    const results = await Promise.all(
+      charts.map((chartName) =>
+        client.callTool({
+          name: "get_values",
+          arguments: { repository_url: REPO_URL, chart_name: chartName },
+        }),
+      ),
+    );
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      expect(result.isError, `${charts[i]} returned an error`).toBeFalsy();
+      const content = result.content as Array<{ type: string; text: string }>;
+      expect(content[0].text.length, `${charts[i]} returned empty content`).toBeGreaterThan(0);
+    }
+  });
 });

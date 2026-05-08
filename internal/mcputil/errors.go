@@ -18,17 +18,22 @@ type OperationError struct {
 }
 
 func (e *OperationError) Error() string {
-	// Format: "op: chart@version: message" or "op: repo: message"
-	if e.Chart != "" && e.Version != "" {
+	// Always include the repo when we have it so an agent calling multiple
+	// registries can tell which one produced the error.
+	switch {
+	case e.Repository != "" && e.Chart != "" && e.Version != "":
+		return fmt.Sprintf("%s: %s/%s@%s: %v", e.Op, e.Repository, e.Chart, e.Version, e.Err)
+	case e.Repository != "" && e.Chart != "":
+		return fmt.Sprintf("%s: %s/%s: %v", e.Op, e.Repository, e.Chart, e.Err)
+	case e.Chart != "" && e.Version != "":
 		return fmt.Sprintf("%s: %s@%s: %v", e.Op, e.Chart, e.Version, e.Err)
-	}
-	if e.Chart != "" {
+	case e.Chart != "":
 		return fmt.Sprintf("%s: %s: %v", e.Op, e.Chart, e.Err)
-	}
-	if e.Repository != "" {
+	case e.Repository != "":
 		return fmt.Sprintf("%s: %s: %v", e.Op, e.Repository, e.Err)
+	default:
+		return fmt.Sprintf("%s: %v", e.Op, e.Err)
 	}
-	return fmt.Sprintf("%s: %v", e.Op, e.Err)
 }
 
 func (e *OperationError) Unwrap() error {

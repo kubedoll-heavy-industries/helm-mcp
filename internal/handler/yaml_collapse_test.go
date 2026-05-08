@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
@@ -90,8 +91,8 @@ labels: {}
 
 	require.NoError(t, err)
 	assert.True(t, collapsed)
-	assert.Contains(t, result, "annotations: object (empty)")
-	assert.Contains(t, result, "labels: object (empty)")
+	assert.Contains(t, result, "annotations: {}")
+	assert.Contains(t, result, "labels: {}")
 }
 
 func TestCollapseYAML_ArraySummarized(t *testing.T) {
@@ -108,7 +109,7 @@ volumes: []
 	require.NoError(t, err)
 	assert.True(t, collapsed)
 	assert.Contains(t, result, "ports: array (3 items)")
-	assert.Contains(t, result, "volumes: array (empty)")
+	assert.Contains(t, result, "volumes: []")
 }
 
 func TestCollapseYAML_ArrayTruncation(t *testing.T) {
@@ -472,7 +473,7 @@ func TestSummarizeOrderedMap(t *testing.T) {
 		input    *orderedMap
 		expected string
 	}{
-		{"empty", &orderedMap{}, "object (empty)"},
+		{"empty", &orderedMap{}, "{}"},
 		{"one key", &orderedMap{entries: []orderedEntry{{key: "a", value: 1}}}, "object (1 key)"},
 		{"multiple keys", &orderedMap{entries: []orderedEntry{{key: "a", value: 1}, {key: "b", value: 2}, {key: "c", value: 3}}}, "object (3 keys)"},
 	}
@@ -490,7 +491,7 @@ func TestSummarizeArray(t *testing.T) {
 		input    []interface{}
 		expected string
 	}{
-		{"empty", []interface{}{}, "array (empty)"},
+		{"empty", []interface{}{}, "[]"},
 		{"one item", []interface{}{1}, "array (1 item)"},
 		{"multiple items", []interface{}{1, 2, 3}, "array (3 items)"},
 	}
@@ -599,8 +600,12 @@ service:
 
 	require.NoError(t, err)
 	assert.True(t, collapsed)
-	// The alias should be rendered visibly, not resolved to the anchor name string
-	assert.Contains(t, result, "*base")
+	// Aliases must resolve to the anchored value so agents see real config,
+	// not the literal `*name` token. kube-prometheus-stack's alertmanager
+	// config relies on this pattern.
+	assert.Contains(t, result, "timeout: 30")
+	assert.Contains(t, result, "retries: 3")
+	assert.NotContains(t, result, "*base")
 }
 
 func TestCollapseYAML_FilterSchemaAnnotations(t *testing.T) {
@@ -670,6 +675,116 @@ service:
 	assert.Contains(t, result, "# Replica count")
 	// Expanded map entry — comment should be shown
 	assert.Contains(t, result, "# Service configuration")
+}
+
+func TestCollapseYAMLAtPath_UsesNearestLeadingCommentBlock(t *testing.T) {
+	input := `prometheus:
+  prometheusSpec:
+    resources: {}
+    # requests:
+    #   memory: 400Mi
+
+    ## Prometheus StorageSpec for persistent data
+    ## ref: https://example.com/storage
+    ##
+    storageSpec: {}
+`
+	opts := CollapseOptions{MaxDepth: 0, ShowDefaults: true, ShowComments: true}
+
+	result, _, err := CollapseYAMLAtPath([]byte(input), ".prometheus.prometheusSpec.storageSpec", opts)
+
+	require.NoError(t, err)
+	assert.Contains(t, result, "# Prometheus StorageSpec for persistent data")
+	assert.Contains(t, result, "{}")
+	assert.NotContains(t, result, "requests")
+}
+
+func TestExtractNearbyExamples_StorageSpec(t *testing.T) {
+	input := `prometheus:
+  prometheusSpec:
+    ## Prometheus StorageSpec for persistent data
+    storageSpec: {}
+    ## Using PersistentVolumeClaim
+    ##
+    #  volumeClaimTemplate:
+    #    spec:
+    #      storageClassName: ssd
+    #      accessModes: ["ReadWriteOnce"]
+    #      resources:
+    #        requests:
+    #          storage: 50Gi
+    retention: 10d
+`
+
+	examples, err := extractNearbyExamples([]byte(input), ".prometheus.prometheusSpec.storageSpec", 1)
+
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	assert.Equal(t, "high", examples[0].Confidence)
+	assert.Contains(t, examples[0].YAML, "volumeClaimTemplate:")
+	assert.Contains(t, examples[0].YAML, "storage: 50Gi")
+	assert.NotContains(t, examples[0].YAML, "Using PersistentVolumeClaim")
+	assert.NotContains(t, examples[0].YAML, "retention")
+}
+
+func TestExtractNearbyExamples_IgnoresPreviousKeyExample(t *testing.T) {
+	input := `prometheus:
+  prometheusSpec:
+    resources: {}
+    # requests:
+    #   memory: 400Mi
+
+    ## Prometheus StorageSpec for persistent data
+    storageSpec: {}
+    # volumeClaimTemplate:
+    #   spec:
+    #     resources:
+    #       requests:
+    #         storage: 50Gi
+`
+
+	examples, err := extractNearbyExamples([]byte(input), ".prometheus.prometheusSpec.storageSpec", 1)
+
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	assert.Contains(t, examples[0].YAML, "volumeClaimTemplate:")
+	assert.NotContains(t, examples[0].YAML, "memory: 400Mi")
+}
+
+func TestExtractNearbyExamples_RejectsProseContinuation(t *testing.T) {
+	input := `persistence:
+  enabled: false
+  # annotations: {}
+  # existingClaim:
+  # Extra labels to apply to a PVC.
+  size: 10Gi
+`
+
+	examples, err := extractNearbyExamples([]byte(input), ".persistence", 3)
+
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	// Prose ("Extra labels...") must be excluded. Trailing placeholder keys
+	// like `existingClaim:` are permitted because real charts (cert-manager,
+	// argo-cd) use them as fill-in-the-blank examples.
+	assert.NotContains(t, examples[0].YAML, "Extra labels")
+}
+
+func TestExtractNearbyExamples_RejectsSentenceWithColon(t *testing.T) {
+	input := `ports:
+  web:
+    redirectTo: {}
+    # hostPort: 8000
+    # containerPort: 8000
+    # Same sets of parameters: to, scheme, permanent and priority.
+`
+
+	examples, err := extractNearbyExamples([]byte(input), ".ports.web", 3)
+
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	assert.Contains(t, examples[0].YAML, "hostPort: 8000")
+	assert.NotContains(t, examples[0].YAML, "Same sets")
 }
 
 // TestCollapseYAML_RealisticChartSizeBudget generates a Traefik-scale values.yaml
@@ -879,6 +994,16 @@ func TestExtractFirstCommentLine(t *testing.T) {
 		{"blank lines skipped", "#\n#\n# actual content", "actual content"},
 		{"schema then content", "# @schema\n# required: true\n# @schema\n# After schema", "After schema"},
 		{"nested schema props", "# @schema\n# type: object\n# properties:\n#   foo:\n#     type: string\n# @schema\n# -- The real desc", "The real desc"},
+		{
+			name: "previous key example before current docs",
+			input: `# requests:
+#   memory: 400Mi
+#
+# Prometheus StorageSpec for persistent data
+# ref: https://example.com/storage
+#`,
+			expected: "Prometheus StorageSpec for persistent data",
+		},
 	}
 
 	for _, tt := range tests {
@@ -941,5 +1066,119 @@ func TestRenderScalar(t *testing.T) {
 			renderScalar(&sb, tt.value, tt.showDefaults)
 			assert.Equal(t, tt.expected, sb.String())
 		})
+	}
+}
+
+// TestCollapseYAML_NestedAliasResolution exercises kube-prometheus-stack's pattern
+// where alertmanager rules use a merge key with an alias. The output must contain
+// resolved values, not the raw alias token.
+func TestCollapseYAML_NestedAliasResolution(t *testing.T) {
+	input := `defaults: &defaults
+  enabled: true
+  retention: 10d
+nested:
+  child: *defaults
+`
+	opts := CollapseOptions{MaxDepth: 5, ShowDefaults: true}
+
+	result, _, err := CollapseYAML([]byte(input), opts)
+	require.NoError(t, err)
+
+	assert.NotContains(t, result, "*defaults", "alias should resolve, not render literal token")
+	// nested.child should expand to the anchored map
+	assert.Contains(t, result, "enabled: true")
+	assert.Contains(t, result, "retention: 10d")
+}
+
+// TestCollapseYAML_UnresolvedAliasFallsBack guards the safety net for malformed
+// YAML where an alias references an undefined anchor.
+func TestCollapseYAML_UnresolvedAliasFallsBack(t *testing.T) {
+	// Forward reference: alias appears before its anchor. YAML technically
+	// forbids this, but the parser may still accept it. We must not crash.
+	input := `service:
+  config: *missing
+`
+	opts := CollapseOptions{MaxDepth: 3, ShowDefaults: true}
+
+	// The parser may reject this outright; we only assert no panic and a
+	// graceful return. If it parses, the unresolved alias falls back to the
+	// raw token rather than crashing.
+	_, _, _ = CollapseYAML([]byte(input), opts)
+}
+
+// TestExampleCandidatesFromCommentBlock_LargeBlockTimeBound regression-tests #3:
+// a 200-line comment block must not hang. Cap kicks in at maxExampleLines=80
+// before the nested yaml.Unmarshal scan.
+func TestExampleCandidatesFromCommentBlock_LargeBlockTimeBound(t *testing.T) {
+	// Build a 200-line block of "key: value" lines that won't pass example
+	// validation (because none parse cleanly together) but will exercise the
+	// nested loop fully if the cap is missing.
+	lines := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		lines = append(lines, fmt.Sprintf("# this is a long line of prose that contains a colon: see issue %d for more details", i))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = exampleCandidatesFromCommentBlock(lines)
+	}()
+
+	select {
+	case <-done:
+		// completed within deadline
+	case <-time.After(2 * time.Second):
+		t.Fatalf("exampleCandidatesFromCommentBlock did not return within 2s on 200-line block — O(n^2)/O(n^3) regression")
+	}
+}
+
+// TestAstToOrdered_NilMappingValueGuard regression-tests #1: a malformed AST
+// node with nil Key must not panic.
+func TestAstToOrdered_NilMappingValueGuard(t *testing.T) {
+	// Direct nil-node call: should return nil, not panic.
+	result := astToOrdered(nil)
+	assert.Nil(t, result)
+}
+
+// TestCollapseYAMLAtPath_ArrayIndex covers the grafana-style sidecar/datasource
+// pattern where charts use array-indexed paths to navigate into list entries.
+func TestCollapseYAMLAtPath_ArrayIndex(t *testing.T) {
+	input := `containers:
+  - name: app
+    image: nginx:1.27
+    ports:
+      - containerPort: 8080
+  - name: sidecar
+    image: redis:7
+    ports:
+      - containerPort: 6379
+`
+	opts := CollapseOptions{MaxDepth: 0, ShowDefaults: true}
+
+	result, _, err := CollapseYAMLAtPath([]byte(input), ".containers[1]", opts)
+	require.NoError(t, err)
+	assert.Contains(t, result, "name: sidecar")
+	assert.Contains(t, result, "redis:7")
+	assert.Contains(t, result, "containerPort: 6379")
+	assert.NotContains(t, result, "name: app", "should select containers[1] only")
+}
+
+// TestExtractNearbyExamples_RealisticProseBlock guards against extracting
+// long-form prose paragraphs (license headers, ref-link sentences) as if
+// they were YAML examples.
+func TestExtractNearbyExamples_RealisticProseBlock(t *testing.T) {
+	input := `service:
+  # This chart is licensed under the Apache 2.0 License.
+  # See https://example.com/license for details.
+  # See also: this is a multi-paragraph note about how the service
+  #   handles upstream timeouts and what fields are involved.
+  enabled: true
+`
+	examples, err := extractNearbyExamples([]byte(input), ".service", 3)
+	require.NoError(t, err)
+	for _, ex := range examples {
+		assert.NotContains(t, ex.YAML, "Apache")
+		assert.NotContains(t, ex.YAML, "license")
+		assert.NotContains(t, ex.YAML, "multi-paragraph")
 	}
 }

@@ -139,13 +139,15 @@ If you prefer to run the binary directly, [install mcp-helm](#install) and repla
 
 ## Available Tools
 
-| Tool | What it does |
-|------|--------------|
-| `search_charts` | Search for charts in a Helm repository |
-| `get_versions` | Get available versions of a chart (newest first, use `limit=1` for latest) |
-| `get_values` | Get chart `values.yaml` with optional JSON schema (`include_schema=true`) |
-| `get_dependencies` | Get chart dependencies from Chart.yaml |
-| `get_notes` | Get chart NOTES.txt (post-install instructions) |
+| Tool | What it does | Useful parameters |
+|------|--------------|-------------------|
+| `search_charts` | List or search charts in a Helm repo | `keyword` (substring filter), `limit` |
+| `get_versions` | Get available versions of a chart (newest first) | `limit=1` for the latest only |
+| `get_values` | Get chart `values.yaml`, optionally as a focused subsection | `path` (e.g. `.ingress`), `depth` (default 2, `0` for full YAML), `include_schema=true`, `include_examples=true` (requires `path`) |
+| `get_dependencies` | Get a chart's sub-charts (with their repo URLs, which can be fed back into the other tools) | — |
+| `get_notes` | Get chart NOTES.txt (post-install instructions) | — |
+
+OCI registries (`oci://...`) do not support browsing — for OCI you must already know the chart name, then call `get_versions` or `get_values` directly with that name.
 
 ## Install
 

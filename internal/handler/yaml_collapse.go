@@ -14,6 +14,10 @@ import (
 const (
 	defaultMaxDepth      = 2
 	defaultMaxArrayItems = 3
+	defaultExampleLimit  = 1
+	maxExampleLimit      = 3
+	maxExampleLines      = 80
+	maxExampleBytes      = 4096
 )
 
 // CollapseOptions controls how YAML is collapsed for progressive disclosure.
@@ -85,7 +89,7 @@ func CollapseYAML(data []byte, opts CollapseOptions) (string, bool, error) {
 	// Extract comments keyed by full dotted path
 	var comments map[string]string
 	if opts.ShowComments {
-		comments = extractComments(file)
+		comments = extractComments(file, data)
 	}
 
 	// Build ordered tree from AST (use first document only; Helm values.yaml is single-document)
@@ -104,6 +108,604 @@ func CollapseYAML(data []byte, opts CollapseOptions) (string, bool, error) {
 	renderNode(&sb, root, "", "", 0, opts, comments)
 
 	return strings.TrimSuffix(sb.String(), "\n"), true, nil
+}
+
+// CollapseYAMLAtPath transforms either the full YAML document or a selected
+// yq-style path such as ".foo.bar[0]". Path extraction uses the parsed YAML AST
+// so comments can be preserved when ShowComments is true.
+func CollapseYAMLAtPath(data []byte, path string, opts CollapseOptions) (string, bool, error) {
+	path = strings.TrimSpace(path)
+	path = strings.TrimPrefix(path, ".")
+	if path == "" {
+		return CollapseYAML(data, opts)
+	}
+
+	segments, err := parseYAMLPathSegments(path)
+	if err != nil {
+		return "", false, err
+	}
+
+	file, err := parser.ParseBytes(data, parser.ParseComments)
+	if err != nil {
+		return "", false, fmt.Errorf("parsing YAML: %w", err)
+	}
+	if len(file.Docs) == 0 || file.Docs[0].Body == nil {
+		return "", false, fmt.Errorf("path not found: %q", path)
+	}
+
+	node, selectedPath, err := findYAMLPathNode(file.Docs[0].Body, segments, path)
+	if err != nil {
+		return "", false, err
+	}
+
+	var comments map[string]string
+	if opts.ShowComments {
+		comments = extractComments(file, data)
+	}
+
+	// MaxDepth=0 means "unlimited" to callers. The renderer uses MaxDepth as a
+	// concrete cutoff, so use a very high cutoff while keeping array behavior.
+	renderOpts := opts
+	if renderOpts.MaxDepth == 0 {
+		renderOpts.MaxDepth = 1 << 30
+	}
+
+	root := astToOrdered(node)
+	var sb strings.Builder
+	sb.Grow(len(data) / 8)
+
+	if opts.ShowComments {
+		writePathComment(&sb, comments[selectedPath], "")
+	}
+	renderFragment(&sb, root, selectedPath, "", 0, renderOpts, comments)
+
+	return strings.TrimSuffix(sb.String(), "\n"), opts.MaxDepth != 0, nil
+}
+
+type yamlPathSegmentKind int
+
+const (
+	yamlPathSegmentKey yamlPathSegmentKind = iota
+	yamlPathSegmentIndex
+)
+
+type yamlPathSegment struct {
+	kind  yamlPathSegmentKind
+	key   string
+	index int
+}
+
+func parseYAMLPathSegments(path string) ([]yamlPathSegment, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	var segments []yamlPathSegment
+	for len(path) > 0 {
+		if path[0] == '.' {
+			path = path[1:]
+			if path == "" {
+				return nil, fmt.Errorf("invalid path: trailing dot")
+			}
+		}
+
+		if path[0] == '[' {
+			index, rest, err := parseYAMLPathIndex(path)
+			if err != nil {
+				return nil, err
+			}
+			segments = append(segments, yamlPathSegment{kind: yamlPathSegmentIndex, index: index})
+			path = rest
+			continue
+		}
+
+		end := 0
+		for end < len(path) && path[end] != '.' && path[end] != '[' {
+			end++
+		}
+		if end == 0 {
+			return nil, fmt.Errorf("invalid path near %q", path)
+		}
+
+		segments = append(segments, yamlPathSegment{kind: yamlPathSegmentKey, key: path[:end]})
+		path = path[end:]
+
+		for strings.HasPrefix(path, "[") {
+			index, rest, err := parseYAMLPathIndex(path)
+			if err != nil {
+				return nil, err
+			}
+			segments = append(segments, yamlPathSegment{kind: yamlPathSegmentIndex, index: index})
+			path = rest
+		}
+	}
+
+	return segments, nil
+}
+
+func parseYAMLPathIndex(path string) (int, string, error) {
+	close := strings.IndexByte(path, ']')
+	if close < 0 {
+		return 0, "", fmt.Errorf("invalid path: missing closing bracket")
+	}
+	raw := path[1:close]
+	if raw == "" {
+		return 0, "", fmt.Errorf("invalid path: empty array index")
+	}
+	index, err := strconv.Atoi(raw)
+	if err != nil || index < 0 {
+		return 0, "", fmt.Errorf("invalid path: array index %q must be a non-negative integer", raw)
+	}
+	return index, path[close+1:], nil
+}
+
+func findYAMLPathNode(root ast.Node, segments []yamlPathSegment, originalPath string) (ast.Node, string, error) {
+	selection, err := findYAMLPathSelection(root, segments, originalPath)
+	if err != nil {
+		return nil, "", err
+	}
+	return selection.node, selection.selectedPath, nil
+}
+
+type yamlPathSelection struct {
+	node         ast.Node
+	selectedPath string
+	keyLine      int
+	keyIndent    int
+}
+
+func findYAMLPathSelection(root ast.Node, segments []yamlPathSegment, originalPath string) (yamlPathSelection, error) {
+	node := unwrapYAMLPathNode(root)
+	selectedPath := ""
+	keyLine := 0
+	keyIndent := 0
+
+	for _, segment := range segments {
+		switch segment.kind {
+		case yamlPathSegmentKey:
+			mapping, ok := unwrapYAMLPathNode(node).(*ast.MappingNode)
+			if !ok {
+				return yamlPathSelection{}, fmt.Errorf("path not found: %q", originalPath)
+			}
+
+			var found ast.Node
+			var keyNode ast.Node
+			for _, value := range mapping.Values {
+				if value == nil || value.Key == nil {
+					continue
+				}
+				if extractKey(value.Key) == segment.key {
+					found = value.Value
+					keyNode = value.Key
+					break
+				}
+			}
+			if found == nil {
+				return yamlPathSelection{}, fmt.Errorf("path not found: %q", originalPath)
+			}
+
+			node = unwrapYAMLPathNode(found)
+			if token := keyNode.GetToken(); token != nil && token.Position != nil {
+				keyLine = token.Position.Line
+				keyIndent = token.Position.Column - 1
+				if keyIndent < 0 {
+					keyIndent = 0
+				}
+			}
+			if selectedPath == "" {
+				selectedPath = segment.key
+			} else {
+				selectedPath += "." + segment.key
+			}
+
+		case yamlPathSegmentIndex:
+			sequence, ok := unwrapYAMLPathNode(node).(*ast.SequenceNode)
+			if !ok || segment.index >= len(sequence.Values) {
+				return yamlPathSelection{}, fmt.Errorf("path not found: %q", originalPath)
+			}
+			node = unwrapYAMLPathNode(sequence.Values[segment.index])
+			selectedPath += fmt.Sprintf("[%d]", segment.index)
+		}
+	}
+
+	return yamlPathSelection{
+		node:         node,
+		selectedPath: selectedPath,
+		keyLine:      keyLine,
+		keyIndent:    keyIndent,
+	}, nil
+}
+
+func unwrapYAMLPathNode(node ast.Node) ast.Node {
+	for {
+		switch n := node.(type) {
+		case *ast.TagNode:
+			node = n.Value
+		case *ast.AnchorNode:
+			node = n.Value
+		default:
+			return node
+		}
+	}
+}
+
+func renderFragment(sb *strings.Builder, node interface{}, path string, indent string, depth int, opts CollapseOptions, comments map[string]string) {
+	switch v := node.(type) {
+	case *orderedMap:
+		if len(v.entries) == 0 {
+			sb.WriteString("{}\n")
+			return
+		}
+		renderMap(sb, v, path, indent, depth, opts, comments)
+	case []interface{}:
+		if len(v) == 0 {
+			sb.WriteString("[]\n")
+			return
+		}
+		renderArray(sb, v, path, indent, depth, opts, comments)
+	default:
+		renderScalar(sb, v, opts.ShowDefaults)
+		sb.WriteString("\n")
+	}
+}
+
+func writePathComment(sb *strings.Builder, comment string, indent string) {
+	if comment == "" {
+		return
+	}
+	sb.WriteString(indent)
+	sb.WriteString("# ")
+	sb.WriteString(comment)
+	sb.WriteString("\n")
+}
+
+type nearbyExample struct {
+	YAML       string
+	Source     string
+	Confidence string
+}
+
+func extractNearbyExamples(data []byte, path string, limit int) ([]nearbyExample, error) {
+	path = strings.TrimSpace(path)
+	path = strings.TrimPrefix(path, ".")
+	if path == "" || limit == 0 {
+		return nil, nil
+	}
+	if limit < 0 {
+		limit = defaultExampleLimit
+	}
+	if limit > maxExampleLimit {
+		limit = maxExampleLimit
+	}
+
+	segments, err := parseYAMLPathSegments(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(segments) == 0 || segments[len(segments)-1].kind != yamlPathSegmentKey {
+		return nil, nil
+	}
+
+	file, err := parser.ParseBytes(data, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing YAML: %w", err)
+	}
+	if len(file.Docs) == 0 || file.Docs[0].Body == nil {
+		return nil, fmt.Errorf("path not found: %q", path)
+	}
+
+	selection, err := findYAMLPathSelection(file.Docs[0].Body, segments, path)
+	if err != nil {
+		return nil, err
+	}
+	if selection.keyLine <= 0 {
+		return nil, nil
+	}
+
+	lines := strings.Split(string(data), "\n")
+	start := selection.keyLine - 1
+	if start < 0 || start >= len(lines) {
+		return nil, nil
+	}
+
+	end := findSelectionEndLine(lines, start, selection.keyIndent)
+	blocks := followingCommentBlocks(lines, start+1, end)
+
+	examples := make([]nearbyExample, 0, limit)
+	seen := make(map[string]struct{})
+	for _, block := range blocks {
+		for _, candidate := range exampleCandidatesFromCommentBlock(block) {
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			examples = append(examples, nearbyExample{
+				YAML:       candidate,
+				Source:     "following_comment_block",
+				Confidence: "high",
+			})
+			if len(examples) >= limit {
+				return examples, nil
+			}
+		}
+	}
+
+	return examples, nil
+}
+
+func findSelectionEndLine(lines []string, keyLineIndex int, keyIndent int) int {
+	for i := keyLineIndex + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if leadingSpaces(lines[i]) <= keyIndent {
+			return i
+		}
+	}
+	return len(lines)
+}
+
+func followingCommentBlocks(lines []string, start int, end int) [][]string {
+	var blocks [][]string
+	var current []string
+	for i := start; i < end && i < len(lines); i++ {
+		line := lines[i]
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			current = append(current, line)
+			continue
+		}
+		if len(current) > 0 {
+			blocks = append(blocks, current)
+			current = nil
+		}
+	}
+	if len(current) > 0 {
+		blocks = append(blocks, current)
+	}
+	return blocks
+}
+
+func exampleCandidatesFromCommentBlock(lines []string) []string {
+	cleaned := make([]string, 0, len(lines))
+	for _, line := range lines {
+		cleaned = append(cleaned, stripCommentPrefix(line))
+	}
+
+	var candidates []string
+	for _, part := range splitNonEmptyLineBlocks(cleaned) {
+		// Cap each block before the nested scan. The inner loop calls
+		// yaml.Unmarshal on every (start, end) substring, so an n-line block
+		// triggers up to n*(n+1)/2 parses. Real charts (kube-prometheus-stack,
+		// argo-cd) have multi-hundred-line comment paragraphs that would hang
+		// the request without this cap.
+		if len(part) > maxExampleLines {
+			part = part[:maxExampleLines]
+		}
+		for start := range part {
+			found := false
+			for end := len(part); end > start; end-- {
+				candidate := normalizeIndent(strings.Join(part[start:end], "\n"))
+				if example, ok := normalizeYAMLExample(candidate); ok {
+					candidates = append(candidates, example)
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+	}
+	return candidates
+}
+
+func splitNonEmptyLineBlocks(lines []string) [][]string {
+	var blocks [][]string
+	var current []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			if len(current) > 0 {
+				blocks = append(blocks, current)
+				current = nil
+			}
+			continue
+		}
+		current = append(current, line)
+	}
+	if len(current) > 0 {
+		blocks = append(blocks, current)
+	}
+	return blocks
+}
+
+func stripCommentPrefix(line string) string {
+	trimmedLeft := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(trimmedLeft, "#") {
+		return strings.TrimRight(line, " \t")
+	}
+	withoutHash := strings.TrimLeft(trimmedLeft, "#")
+	withoutHash = strings.TrimPrefix(withoutHash, " ")
+	return strings.TrimRight(withoutHash, " \t")
+}
+
+func normalizeIndent(text string) string {
+	lines := strings.Split(strings.Trim(text, "\n"), "\n")
+	minIndent := -1
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := leadingSpaces(line)
+		if minIndent == -1 || indent < minIndent {
+			minIndent = indent
+		}
+	}
+	if minIndent <= 0 {
+		return strings.TrimSpace(strings.Join(lines, "\n"))
+	}
+	for i, line := range lines {
+		if len(line) >= minIndent {
+			lines[i] = line[minIndent:]
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func normalizeYAMLExample(candidate string) (string, bool) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || len(candidate) > maxExampleBytes {
+		return "", false
+	}
+	lines := strings.Split(candidate, "\n")
+	if len(lines) > maxExampleLines {
+		lines = lines[:maxExampleLines]
+		candidate = strings.TrimSpace(strings.Join(lines, "\n"))
+	}
+	if !looksLikeYAMLExample(candidate) {
+		return "", false
+	}
+	if containsBareProseLine(candidate) {
+		return "", false
+	}
+	if !hasValidBlockIndentation(candidate) {
+		return "", false
+	}
+	if containsProseMappingKey(candidate) {
+		return "", false
+	}
+
+	var parsed interface{}
+	if err := yaml.Unmarshal([]byte(candidate), &parsed); err != nil {
+		return "", false
+	}
+	if !isExampleRoot(parsed) {
+		return "", false
+	}
+	return candidate, true
+}
+
+func containsProseMappingKey(candidate string) bool {
+	for _, line := range strings.Split(candidate, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "- ") {
+			continue
+		}
+		colon := strings.IndexByte(trimmed, ':')
+		if colon < 0 {
+			continue
+		}
+		// In YAML a key:value pair has the colon followed by whitespace
+		// or end-of-line. A `:` followed by anything else (e.g. `://` in a
+		// URL) isn't a mapping key — skip the line so we don't measure the
+		// "key" half of a URL substring as a prose key.
+		if colon+1 < len(trimmed) {
+			next := trimmed[colon+1]
+			if next != ' ' && next != '\t' {
+				continue
+			}
+		}
+		key := strings.TrimSpace(trimmed[:colon])
+		if key == "" || strings.HasPrefix(key, "\"") || strings.HasPrefix(key, "'") {
+			continue
+		}
+		if strings.ContainsAny(key, " \t") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasValidBlockIndentation(candidate string) bool {
+	lines := strings.Split(candidate, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if !strings.HasSuffix(trimmed, ":") {
+			continue
+		}
+		indent := leadingSpaces(line)
+		for j := i + 1; j < len(lines); j++ {
+			next := strings.TrimSpace(lines[j])
+			if next == "" {
+				continue
+			}
+			if leadingSpaces(lines[j]) <= indent {
+				// Sibling at the same or lesser indent without an intervening
+				// child means the key was supposed to have content but doesn't.
+				return false
+			}
+			break
+		}
+		// A trailing `key:` with nothing after is valid YAML (parses as null)
+		// and is a common shape in chart commenting where the key acts as a
+		// placeholder. Don't reject those.
+	}
+	return true
+}
+
+func containsBareProseLine(candidate string) bool {
+	for _, line := range strings.Split(candidate, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if leadingSpaces(line) > 0 {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "-") {
+			continue
+		}
+		if strings.Contains(trimmed, ":") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func looksLikeYAMLExample(candidate string) bool {
+	for _, line := range strings.Split(candidate, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "- ") || strings.Contains(trimmed, ":") {
+			return true
+		}
+	}
+	return false
+}
+
+func isExampleRoot(value interface{}) bool {
+	switch value.(type) {
+	case map[string]interface{}, []interface{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func leadingSpaces(line string) int {
+	// YAML forbids tabs in indentation, but free-form comment text (which is
+	// what we measure here) can contain tabs. Treat each tab as 4 spaces — the
+	// most common YAML indent width in the wild. Counting tabs as 1 column
+	// (matching the AST) misaligns against subsequent space-indented siblings;
+	// 4 is closer to typical visual indent without overcounting deeply.
+	count := 0
+	for _, r := range line {
+		switch r {
+		case ' ':
+			count++
+		case '\t':
+			count += 4
+		default:
+			return count
+		}
+	}
+	return count
 }
 
 // extractKey returns the raw key text from an AST key node, without inline
@@ -131,7 +733,13 @@ func unquoteKey(key string) string {
 
 // astToOrdered converts an AST node into an ordered tree structure.
 // Maps become *orderedMap, sequences become []interface{}, scalars become Go values.
+// YAML anchors are tracked so aliases resolve to the anchored value rather than
+// rendering as the literal `*name` token.
 func astToOrdered(node ast.Node) interface{} {
+	return astToOrderedWithAnchors(node, map[string]ast.Node{})
+}
+
+func astToOrderedWithAnchors(node ast.Node, anchors map[string]ast.Node) interface{} {
 	if node == nil {
 		return nil
 	}
@@ -140,37 +748,51 @@ func astToOrdered(node ast.Node) interface{} {
 	case *ast.MappingNode:
 		om := &orderedMap{entries: make([]orderedEntry, 0, len(n.Values))}
 		for _, v := range n.Values {
-			if v.Key != nil {
-				om.entries = append(om.entries, orderedEntry{
-					key:   extractKey(v.Key),
-					value: astToOrdered(v.Value),
-				})
+			if v == nil || v.Key == nil {
+				continue
 			}
+			om.entries = append(om.entries, orderedEntry{
+				key:   extractKey(v.Key),
+				value: astToOrderedWithAnchors(v.Value, anchors),
+			})
 		}
 		return om
 
 	case *ast.MappingValueNode:
 		// A single mapping value at the document root
+		if n.Key == nil {
+			return nil
+		}
 		om := &orderedMap{entries: []orderedEntry{{
 			key:   extractKey(n.Key),
-			value: astToOrdered(n.Value),
+			value: astToOrderedWithAnchors(n.Value, anchors),
 		}}}
 		return om
 
 	case *ast.SequenceNode:
 		arr := make([]interface{}, 0, len(n.Values))
 		for _, v := range n.Values {
-			arr = append(arr, astToOrdered(v))
+			arr = append(arr, astToOrderedWithAnchors(v, anchors))
 		}
 		return arr
 
 	case *ast.TagNode:
-		return astToOrdered(n.Value)
+		return astToOrderedWithAnchors(n.Value, anchors)
 
 	case *ast.AnchorNode:
-		return astToOrdered(n.Value)
+		if name := anchorName(n); name != "" && n.Value != nil {
+			anchors[name] = n.Value
+		}
+		return astToOrderedWithAnchors(n.Value, anchors)
 
 	case *ast.AliasNode:
+		if name := aliasName(n); name != "" {
+			if target, ok := anchors[name]; ok {
+				return astToOrderedWithAnchors(target, anchors)
+			}
+		}
+		// Anchor not found (forward reference or malformed YAML): preserve the
+		// raw alias token so the agent can see something rather than nothing.
 		return n.String()
 
 	case *ast.NullNode:
@@ -197,6 +819,28 @@ func astToOrdered(node ast.Node) interface{} {
 	default:
 		return node.String()
 	}
+}
+
+// anchorName extracts the anchor name (without the leading '&') from an AnchorNode.
+func anchorName(n *ast.AnchorNode) string {
+	if n == nil || n.Name == nil {
+		return ""
+	}
+	if s, ok := n.Name.(*ast.StringNode); ok {
+		return s.Value
+	}
+	return strings.TrimPrefix(n.Name.String(), "&")
+}
+
+// aliasName extracts the anchor name (without the leading '*') from an AliasNode.
+func aliasName(n *ast.AliasNode) string {
+	if n == nil || n.Value == nil {
+		return ""
+	}
+	if s, ok := n.Value.(*ast.StringNode); ok {
+		return s.Value
+	}
+	return strings.TrimPrefix(n.String(), "*")
 }
 
 // renderNode renders any YAML node with depth tracking.
@@ -264,7 +908,7 @@ func renderArrayItem(sb *strings.Builder, item interface{}, path string, indent 
 	switch v := item.(type) {
 	case *orderedMap:
 		if len(v.entries) == 0 {
-			sb.WriteString("object (empty)\n")
+			sb.WriteString("{}\n")
 			return
 		}
 		if depth >= opts.MaxDepth {
@@ -276,7 +920,7 @@ func renderArrayItem(sb *strings.Builder, item interface{}, path string, indent 
 
 	case []interface{}:
 		if len(v) == 0 {
-			sb.WriteString("array (empty)\n")
+			sb.WriteString("[]\n")
 			return
 		}
 		if depth >= opts.MaxDepth {
@@ -321,7 +965,7 @@ func renderValue(sb *strings.Builder, value interface{}, path string, indent str
 	switch v := value.(type) {
 	case *orderedMap:
 		if len(v.entries) == 0 {
-			sb.WriteString("object (empty)\n")
+			sb.WriteString("{}\n")
 			return
 		}
 		if depth >= opts.MaxDepth {
@@ -334,7 +978,7 @@ func renderValue(sb *strings.Builder, value interface{}, path string, indent str
 
 	case []interface{}:
 		if len(v) == 0 {
-			sb.WriteString("array (empty)\n")
+			sb.WriteString("[]\n")
 			return
 		}
 		if depth >= opts.MaxDepth {
@@ -361,10 +1005,12 @@ func renderScalar(sb *strings.Builder, v interface{}, showDefaults bool) {
 }
 
 // summarizeOrderedMap returns a type summary for an ordered map.
+// Empty maps render as literal "{}" so the agent can tell at a glance the map
+// is actually empty rather than collapsed-with-hidden-content.
 func summarizeOrderedMap(m *orderedMap) string {
 	switch len(m.entries) {
 	case 0:
-		return "object (empty)"
+		return "{}"
 	case 1:
 		return "object (1 key)"
 	default:
@@ -373,10 +1019,12 @@ func summarizeOrderedMap(m *orderedMap) string {
 }
 
 // summarizeArray returns a summary for an array.
+// Empty arrays render as literal "[]" so the agent can tell at a glance the
+// array is actually empty rather than truncated.
 func summarizeArray(arr []interface{}) string {
 	switch len(arr) {
 	case 0:
-		return "array (empty)"
+		return "[]"
 	case 1:
 		return "array (1 item)"
 	default:
@@ -463,11 +1111,12 @@ func needsQuoting(s string) bool {
 
 // extractComments extracts comments from a parsed YAML file.
 // Returns a map of full dotted paths to their associated comments.
-func extractComments(file *ast.File) map[string]string {
+func extractComments(file *ast.File, source []byte) map[string]string {
 	comments := make(map[string]string, 8)
+	lines := strings.Split(string(source), "\n")
 
 	if len(file.Docs) > 0 {
-		extractCommentsFromNode(file.Docs[0].Body, "", comments)
+		extractCommentsFromNode(file.Docs[0].Body, "", comments, lines)
 	}
 
 	return comments
@@ -475,7 +1124,7 @@ func extractComments(file *ast.File) map[string]string {
 
 // extractCommentsFromNode recursively extracts comments from AST nodes.
 // Comments are keyed by full dotted path to avoid collisions.
-func extractCommentsFromNode(node ast.Node, path string, comments map[string]string) {
+func extractCommentsFromNode(node ast.Node, path string, comments map[string]string, sourceLines []string) {
 	if node == nil {
 		return
 	}
@@ -483,7 +1132,7 @@ func extractCommentsFromNode(node ast.Node, path string, comments map[string]str
 	switch n := node.(type) {
 	case *ast.MappingNode:
 		for _, value := range n.Values {
-			extractCommentsFromNode(value, path, comments)
+			extractCommentsFromNode(value, path, comments, sourceLines)
 		}
 	case *ast.MappingValueNode:
 		keyNode := n.Key
@@ -491,7 +1140,7 @@ func extractCommentsFromNode(node ast.Node, path string, comments map[string]str
 			return
 		}
 
-		key := unquoteKey(keyNode.String())
+		key := extractKey(keyNode)
 		newPath := key
 		if path != "" {
 			newPath = path + "." + key
@@ -501,35 +1150,82 @@ func extractCommentsFromNode(node ast.Node, path string, comments map[string]str
 		// the value node itself. goccy/go-yaml attaches preceding-line comments to
 		// the MappingValueNode, inline comments on the key node, and value-trailing
 		// comments (e.g., `key: value  # comment`) on the value AST node.
-		var commentNode *ast.CommentGroupNode
-		if c := keyNode.GetComment(); c != nil {
-			commentNode = c
-		} else if c := n.GetComment(); c != nil {
-			commentNode = c
-		} else if n.Value != nil {
-			if c := n.Value.GetComment(); c != nil {
+		text := extractLeadingCommentLine(sourceLines, keyNode)
+		if text == "" {
+			var commentNode *ast.CommentGroupNode
+			if c := keyNode.GetComment(); c != nil {
 				commentNode = c
+			} else if c := n.GetComment(); c != nil {
+				commentNode = c
+			} else if n.Value != nil && isScalarASTNode(n.Value) {
+				if c := n.Value.GetComment(); c != nil {
+					commentNode = c
+				}
+			}
+			if commentNode != nil {
+				text = extractFirstCommentLine(commentNode.String())
 			}
 		}
-		if commentNode != nil {
-			text := extractFirstCommentLine(commentNode.String())
-			if text != "" {
-				comments[newPath] = text
-			}
+		if text != "" {
+			comments[newPath] = text
 		}
 
-		extractCommentsFromNode(n.Value, newPath, comments)
+		extractCommentsFromNode(n.Value, newPath, comments, sourceLines)
 
 	case *ast.SequenceNode:
 		for i, value := range n.Values {
-			extractCommentsFromNode(value, fmt.Sprintf("%s[%d]", path, i), comments)
+			extractCommentsFromNode(value, fmt.Sprintf("%s[%d]", path, i), comments, sourceLines)
 		}
 
 	case *ast.AnchorNode:
-		extractCommentsFromNode(n.Value, path, comments)
+		extractCommentsFromNode(n.Value, path, comments, sourceLines)
 
 	case *ast.TagNode:
-		extractCommentsFromNode(n.Value, path, comments)
+		extractCommentsFromNode(n.Value, path, comments, sourceLines)
+	}
+}
+
+func extractLeadingCommentLine(sourceLines []string, keyNode ast.Node) string {
+	token := keyNode.GetToken()
+	if token == nil || token.Position == nil || token.Position.Line <= 1 {
+		return ""
+	}
+
+	lineIndex := token.Position.Line - 2 // previous source line, zero-based
+	if lineIndex >= len(sourceLines) {
+		lineIndex = len(sourceLines) - 1
+	}
+
+	var block []string
+	for i := lineIndex; i >= 0; i-- {
+		line := strings.TrimSpace(sourceLines[i])
+		if line == "" {
+			break
+		}
+		if !strings.HasPrefix(line, "#") {
+			break
+		}
+		block = append([]string{line}, block...)
+	}
+
+	if len(block) == 0 {
+		return ""
+	}
+	return extractFirstCommentLine(strings.Join(block, "\n"))
+}
+
+func isScalarASTNode(node ast.Node) bool {
+	switch unwrapYAMLPathNode(node).(type) {
+	case *ast.NullNode,
+		*ast.BoolNode,
+		*ast.IntegerNode,
+		*ast.FloatNode,
+		*ast.StringNode,
+		*ast.InfinityNode,
+		*ast.NanNode:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -538,11 +1234,18 @@ func extractCommentsFromNode(node ast.Node, path string, comments map[string]str
 // (Helm schema annotations) are skipped as they render as garbled output for LLMs.
 func extractFirstCommentLine(raw string) string {
 	inSchema := false
+	var blocks [][]string
+	var current []string
+
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		line = strings.TrimLeft(line, "#")
 		line = strings.TrimSpace(line)
 		if line == "" {
+			if len(current) > 0 {
+				blocks = append(blocks, current)
+				current = nil
+			}
 			continue
 		}
 		if strings.HasPrefix(line, "@schema") {
@@ -554,9 +1257,23 @@ func extractFirstCommentLine(raw string) string {
 		}
 		// Helm convention: "-- description" prefix
 		line = strings.TrimPrefix(line, "-- ")
-		return line
+		current = append(current, line)
 	}
-	return ""
+	if len(current) > 0 {
+		blocks = append(blocks, current)
+	}
+	if len(blocks) == 0 {
+		return ""
+	}
+
+	// goccy can attach a commented-out example from the previous key to the
+	// next key's leading docs. Helm values usually separate those blocks with
+	// a blank comment line, so prefer the first line of the last block.
+	last := blocks[len(blocks)-1]
+	if len(last) == 0 {
+		return ""
+	}
+	return last[0]
 }
 
 // willCollapse returns true if the value would be immediately collapsed

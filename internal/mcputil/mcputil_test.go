@@ -95,16 +95,22 @@ func TestHandleError(t *testing.T) {
 func TestOperationError(t *testing.T) {
 	baseErr := errors.New("network timeout")
 
-	t.Run("formats with chart and version", func(t *testing.T) {
+	t.Run("formats with repo, chart and version", func(t *testing.T) {
 		err := OpError("get_values", "https://repo.com", "nginx", "1.0.0", baseErr)
 
-		assert.Equal(t, "get_values: nginx@1.0.0: network timeout", err.Error())
+		assert.Equal(t, "get_values: https://repo.com/nginx@1.0.0: network timeout", err.Error())
 	})
 
-	t.Run("formats with chart only", func(t *testing.T) {
+	t.Run("formats with repo and chart only", func(t *testing.T) {
 		err := OpError("get_values", "https://repo.com", "nginx", "", baseErr)
 
-		assert.Equal(t, "get_values: nginx: network timeout", err.Error())
+		assert.Equal(t, "get_values: https://repo.com/nginx: network timeout", err.Error())
+	})
+
+	t.Run("formats without repo falls back to chart-only", func(t *testing.T) {
+		err := OpError("get_values", "", "nginx", "1.0.0", baseErr)
+
+		assert.Equal(t, "get_values: nginx@1.0.0: network timeout", err.Error())
 	})
 
 	t.Run("formats with repo only", func(t *testing.T) {
