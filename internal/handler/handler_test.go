@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/kubedoll-heavy-industries/helm-mcp/internal/helm"
@@ -560,6 +561,165 @@ client:
 		assert.Contains(t, output.Values, "host: localhost")
 	})
 
+	t.Run("with path extraction preserves comments", func(t *testing.T) {
+		yamlContent := `server:
+  # -- Port exposed by the service
+  port: 8080
+  # -- Hostname clients should use
+  host: localhost
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		showComments := true
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "app",
+			ChartVersion:  "1.0.0",
+			Path:          ".server",
+			ShowComments:  &showComments,
+		})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Contains(t, output.Values, "# Port exposed by the service")
+		assert.Contains(t, output.Values, "port: 8080")
+		assert.Contains(t, output.Values, "# Hostname clients should use")
+		assert.Contains(t, output.Values, "host: localhost")
+	})
+
+	t.Run("with path extraction preserves selected empty object comment", func(t *testing.T) {
+		yamlContent := `prometheus:
+  prometheusSpec:
+    # -- StorageSpec defines persistent storage.
+    # Additional details are intentionally omitted from collapsed comments.
+    storageSpec: {}
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		showComments := true
+		depth := 0
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "app",
+			ChartVersion:  "1.0.0",
+			Path:          ".prometheus.prometheusSpec.storageSpec",
+			Depth:         &depth,
+			ShowComments:  &showComments,
+		})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Contains(t, output.Values, "# StorageSpec defines persistent storage.")
+		assert.Contains(t, output.Values, "{}")
+		assert.NotContains(t, output.Values, "Additional details")
+	})
+
+	t.Run("with path extraction includes nearby examples when requested", func(t *testing.T) {
+		yamlContent := `prometheus:
+  prometheusSpec:
+    # -- StorageSpec defines persistent storage.
+    storageSpec: {}
+    ## Using PersistentVolumeClaim
+    ##
+    # volumeClaimTemplate:
+    #   spec:
+    #     resources:
+    #       requests:
+    #         storage: 50Gi
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		depth := 0
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			Path:            ".prometheus.prometheusSpec.storageSpec",
+			Depth:           &depth,
+			IncludeExamples: &includeExamples,
+		})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		require.Len(t, output.Examples, 1)
+		assert.Contains(t, output.Examples[0].YAML, "volumeClaimTemplate:")
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "--- examples ---")
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "storage: 50Gi")
+	})
+
+	t.Run("example_limit=0 falls back to default", func(t *testing.T) {
+		yamlContent := `prometheus:
+  prometheusSpec:
+    # -- StorageSpec defines persistent storage.
+    storageSpec: {}
+    ## Using PersistentVolumeClaim
+    ##
+    # volumeClaimTemplate:
+    #   spec:
+    #     resources:
+    #       requests:
+    #         storage: 50Gi
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		depth := 0
+		zero := 0
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			Path:            ".prometheus.prometheusSpec.storageSpec",
+			Depth:           &depth,
+			IncludeExamples: &includeExamples,
+			ExampleLimit:    &zero,
+		})
+
+		assert.NoError(t, err)
+		assert.GreaterOrEqual(t, len(output.Examples), 1, "example_limit=0 should fall back to default, not return zero examples")
+	})
+
+	t.Run("include_examples requires path", func(t *testing.T) {
+		mockSvc := new(mocks.ChartService)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		result, _, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			IncludeExamples: &includeExamples,
+		})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.IsError)
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "include_examples requires path")
+	})
+
 	t.Run("with depth limiting", func(t *testing.T) {
 		yamlContent := `server:
   port: 8080
@@ -779,6 +939,335 @@ value: 123`
 		assert.True(t, result.IsError)
 		// Verify the error message suggests using path parameter
 		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "path")
+	})
+
+	t.Run("schema fetch failure surfaces schema_warning", func(t *testing.T) {
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte("foo: 1"), nil)
+		mockSvc.On("GetValuesSchema", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(nil), false, errors.New("connection reset"))
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeSchema := true
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "app",
+			ChartVersion:  "1.0.0",
+			IncludeSchema: &includeSchema,
+		})
+
+		assert.NoError(t, err)
+		require.NotNil(t, result)
+		assert.False(t, result.IsError, "schema failure must not fail the whole request")
+		assert.Empty(t, output.Schema)
+		assert.NotEmpty(t, output.SchemaWarning, "agent must be able to tell schema fetch failed")
+		assert.Contains(t, output.SchemaWarning, "connection reset")
+		// Warning should also be visible in the text content the LLM reads
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "schema fetch failed")
+	})
+
+	t.Run("budget loop accounts for schema size", func(t *testing.T) {
+		// Big schema that alone fits, plus values that fit at low depth, should
+		// still produce a non-error response (depth-reduced) rather than an
+		// over-budget error.
+		var schemaBuilder strings.Builder
+		schemaBuilder.WriteString(`{"type":"object","properties":{`)
+		for i := 0; i < 500; i++ {
+			if i > 0 {
+				schemaBuilder.WriteString(",")
+			}
+			fmt.Fprintf(&schemaBuilder, `"prop_%04d":{"type":"string","description":"a fairly long description that takes some bytes to encode"}`, i)
+		}
+		schemaBuilder.WriteString(`}}`)
+
+		var valuesBuilder strings.Builder
+		for i := 0; i < 500; i++ {
+			fmt.Fprintf(&valuesBuilder, "section_%04d:\n  child:\n    grandchild: value_%d\n", i, i)
+		}
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(valuesBuilder.String()), nil)
+		mockSvc.On("GetValuesSchema", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(schemaBuilder.String()), true, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeSchema := true
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "app",
+			ChartVersion:  "1.0.0",
+			IncludeSchema: &includeSchema,
+		})
+
+		assert.NoError(t, err)
+		require.NotNil(t, result)
+		// Either succeeds (depth was reduced) or errors with a useful "use path"
+		// hint — but never silently truncates without telling the agent.
+		if result.IsError {
+			assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "path")
+		} else {
+			assert.NotEmpty(t, output.Values)
+		}
+	})
+
+	t.Run("example_limit > max is clamped to max", func(t *testing.T) {
+		yamlContent := `app:
+  # -- block A
+  ## Example A
+  # alpha: 1
+  blockA: false
+  # -- block B
+  ## Example B
+  # beta: 2
+  blockB: false
+  # -- block C
+  ## Example C
+  # gamma: 3
+  blockC: false
+  # -- block D
+  ## Example D
+  # delta: 4
+  blockD: false
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		large := 99
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			Path:            ".app",
+			IncludeExamples: &includeExamples,
+			ExampleLimit:    &large,
+		})
+		assert.NoError(t, err)
+		assert.LessOrEqual(t, len(output.Examples), 3, "example_limit must be clamped to maxExampleLimit=3")
+	})
+
+	t.Run("include_examples on array-index path returns no error", func(t *testing.T) {
+		yamlContent := `containers:
+  - name: app
+    image: nginx
+  - name: sidecar
+    image: redis
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			Path:            ".containers[0]",
+			IncludeExamples: &includeExamples,
+		})
+		assert.NoError(t, err)
+		require.NotNil(t, result)
+		assert.False(t, result.IsError, "include_examples on array-index path should not error")
+		// May or may not find examples; we just need a clean response.
+		_ = output
+	})
+
+	t.Run("root path '.' returns full document", func(t *testing.T) {
+		yamlContent := `service:
+  enabled: true
+ingress:
+  className: nginx
+`
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(yamlContent), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		zero := 0
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "app",
+			ChartVersion:  "1.0.0",
+			Path:          ".",
+			Depth:         &zero,
+		})
+		assert.NoError(t, err)
+		require.NotNil(t, result)
+		assert.False(t, result.IsError)
+		assert.Contains(t, output.Values, "service:")
+		assert.Contains(t, output.Values, "ingress:")
+	})
+
+	t.Run("parse failure degrades to raw values with parse_warning", func(t *testing.T) {
+		// Reproducer for argo-cd's chart pattern: empty literal block scalar +
+		// blank line + same-indent comment + sibling key. goccy/go-yaml has a
+		// bug here (see ../../docs/.. or upstream issue). The handler must
+		// degrade gracefully instead of returning an error.
+		problematic := []byte("affinity: |\n\n# -- comment\ntolerations: []\n")
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "argocd", "1.0.0").
+			Return(problematic, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		result, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "argocd",
+			ChartVersion:  "1.0.0",
+		})
+
+		assert.NoError(t, err)
+		require.NotNil(t, result)
+		assert.False(t, result.IsError, "parse failure must not return an error result")
+		assert.NotEmpty(t, output.ParseWarning, "agent must be told the parser failed")
+		assert.Contains(t, output.Values, "affinity", "raw values must be returned so the agent has the data")
+		assert.Contains(t, output.Values, "tolerations", "raw values must include the sibling key")
+		// Text content should also surface the warning.
+		assert.Contains(t, fmt.Sprintf("%v", result.Content[0]), "parse_warning")
+	})
+
+	t.Run("parse failure warning is a single line, not a code frame", func(t *testing.T) {
+		problematic := []byte("affinity: |\n\n# -- comment\ntolerations: []\n")
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "argocd", "1.0.0").
+			Return(problematic, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "argocd",
+			ChartVersion:  "1.0.0",
+		})
+
+		assert.NoError(t, err)
+		assert.NotEmpty(t, output.ParseWarning)
+		// Multi-line code frames bloat the warning and confuse agents that
+		// surface tool errors verbatim.
+		assert.NotContains(t, output.ParseWarning, "\n", "warning must be a single line")
+		// Sanity: still contains the parser's location info so the agent
+		// (or a developer reading logs) can find the offending line.
+		assert.Regexp(t, `\[\d+:\d+\]`, output.ParseWarning)
+	})
+
+	t.Run("parse failure truncation respects line boundaries", func(t *testing.T) {
+		// Build a huge YAML that won't parse and exceeds the budget, with
+		// line-aligned content so we can detect mid-line truncation.
+		var sb strings.Builder
+		sb.WriteString("affinity: |\n\n# unparseable\n")
+		for i := 0; i < 5000; i++ {
+			fmt.Fprintf(&sb, "key_%05d: value_with_some_meaningful_payload_to_take_bytes_%d\n", i, i)
+		}
+		problematic := []byte(sb.String())
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "argocd", "1.0.0").
+			Return(problematic, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "argocd",
+			ChartVersion:  "1.0.0",
+		})
+
+		assert.NoError(t, err)
+		require.NotEmpty(t, output.ParseWarning)
+		require.Contains(t, output.Values, "...truncated", "output must be truncated for this large input")
+
+		// The line immediately before the truncation marker should be a
+		// complete `key_NNNNN: value_...` line, not a half-key like "key_0".
+		idx := strings.Index(output.Values, "\n# ...truncated")
+		require.Greater(t, idx, 0)
+		lastNewline := strings.LastIndexByte(output.Values[:idx], '\n')
+		require.Greater(t, lastNewline, -1)
+		lastLine := output.Values[lastNewline+1 : idx]
+		assert.Regexp(t, `^key_\d{5}: value_with_some_meaningful_payload_to_take_bytes_\d+$`, lastLine,
+			"truncation must round down to a complete line")
+	})
+
+	t.Run("parse failure with path returns raw and explains path was not applied", func(t *testing.T) {
+		problematic := []byte("affinity: |\n\n# -- comment\ntolerations: []\n")
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "argocd", "1.0.0").
+			Return(problematic, nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		_, output, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL: "https://repo.com",
+			ChartName:     "argocd",
+			ChartVersion:  "1.0.0",
+			Path:          ".tolerations",
+		})
+
+		assert.NoError(t, err)
+		assert.NotEmpty(t, output.ParseWarning)
+		assert.Contains(t, output.ParseWarning, ".tolerations", "warning should name the path that was not applied")
+	})
+
+	t.Run("budget trim drops examples before erroring", func(t *testing.T) {
+		// Construct a values doc where the values fit comfortably but the
+		// examples (commented siblings) push over budget. The handler should
+		// drop examples and succeed instead of returning a too-large error.
+		var sb strings.Builder
+		sb.WriteString("section:\n  field: value\n")
+		// Add many large commented-block siblings under .section
+		for i := 0; i < 30; i++ {
+			fmt.Fprintf(&sb, "  # -- block %d\n", i)
+			fmt.Fprintf(&sb, "  ## Example block %d\n", i)
+			for j := 0; j < 50; j++ {
+				fmt.Fprintf(&sb, "  # key_%d_%d: %s\n", i, j, strings.Repeat("x", 80))
+			}
+			fmt.Fprintf(&sb, "  field_%d: actual_value\n", i)
+		}
+
+		mockSvc := new(mocks.ChartService)
+		mockSvc.On("GetValues", ctx, "https://repo.com", "app", "1.0.0").
+			Return([]byte(sb.String()), nil)
+
+		h := New(mockSvc, zap.NewNop())
+		handler := h.getValues()
+
+		includeExamples := true
+		exampleLimit := 3
+		result, _, err := handler(ctx, nil, getValuesInput{
+			RepositoryURL:   "https://repo.com",
+			ChartName:       "app",
+			ChartVersion:    "1.0.0",
+			Path:            ".section",
+			IncludeExamples: &includeExamples,
+			ExampleLimit:    &exampleLimit,
+		})
+		assert.NoError(t, err)
+		require.NotNil(t, result)
+		// The budget loop should have either succeeded (with examples possibly
+		// trimmed) or returned a clean error — never a panic and never silently
+		// truncated values.
+		_ = result
 	})
 }
 

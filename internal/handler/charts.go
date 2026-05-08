@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/goccy/go-yaml"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kubedoll-heavy-industries/helm-mcp/internal/mcputil"
@@ -39,22 +38,33 @@ type searchChartsOutput struct {
 }
 
 type getValuesInput struct {
-	RepositoryURL string `json:"repository_url" jsonschema:"Helm repository URL (e.g. https://charts.bitnami.com/bitnami) or OCI registry (e.g. oci://ghcr.io/traefik/helm)"`
-	ChartName     string `json:"chart_name" jsonschema:"Chart name (e.g. postgresql)"`
-	ChartVersion  string `json:"chart_version,omitempty" jsonschema:"Chart version (defaults to latest)"`
-	Path          string `json:"path,omitempty" jsonschema:"YAML path (e.g. .ingress.enabled)"`
-	Depth         *int   `json:"depth,omitempty" jsonschema:"Max nesting depth (default 2, 0 for unlimited)"`
-	MaxArrayItems *int   `json:"max_array_items,omitempty" jsonschema:"Max array items before truncation (default 3, 0 for unlimited)"`
-	ShowComments  *bool  `json:"show_comments,omitempty" jsonschema:"Preserve YAML comments"`
-	ShowDefaults  *bool  `json:"show_defaults,omitempty" jsonschema:"Include default values"`
-	IncludeSchema *bool  `json:"include_schema,omitempty" jsonschema:"Include values.schema.json in response"`
+	RepositoryURL   string `json:"repository_url" jsonschema:"Helm repository URL (e.g. https://charts.bitnami.com/bitnami) or OCI registry (e.g. oci://ghcr.io/traefik/helm)"`
+	ChartName       string `json:"chart_name" jsonschema:"Chart name (e.g. postgresql)"`
+	ChartVersion    string `json:"chart_version,omitempty" jsonschema:"Chart version (defaults to latest)"`
+	Path            string `json:"path,omitempty" jsonschema:"YAML path (e.g. .ingress.enabled)"`
+	Depth           *int   `json:"depth,omitempty" jsonschema:"Max nesting depth (default 2, 0 for unlimited)"`
+	MaxArrayItems   *int   `json:"max_array_items,omitempty" jsonschema:"Max array items before truncation (default 3, 0 for unlimited)"`
+	ShowComments    *bool  `json:"show_comments,omitempty" jsonschema:"Preserve YAML comments"`
+	ShowDefaults    *bool  `json:"show_defaults,omitempty" jsonschema:"Include default values"`
+	IncludeSchema   *bool  `json:"include_schema,omitempty" jsonschema:"Include values.schema.json in response"`
+	IncludeExamples *bool  `json:"include_examples,omitempty" jsonschema:"Include nearby commented YAML examples for the selected path (requires path to be set)"`
+	ExampleLimit    *int   `json:"example_limit,omitempty" jsonschema:"Maximum nearby examples to include (default 1, max 3, 0 falls back to default)"`
 }
 
 type getValuesOutput struct {
-	Version string `json:"version" jsonschema:"Resolved chart version (especially useful when chart_version was omitted and latest was used)"`
-	Values  string `json:"values" jsonschema:"Values content (YAML)"`
-	Path    string `json:"path,omitempty" jsonschema:"Extracted path, if specified"`
-	Schema  string `json:"schema,omitempty" jsonschema:"JSON Schema for values (if include_schema=true and schema exists)"`
+	Version       string          `json:"version" jsonschema:"Resolved chart version (especially useful when chart_version was omitted and latest was used)"`
+	Values        string          `json:"values" jsonschema:"Values content (YAML)"`
+	Path          string          `json:"path,omitempty" jsonschema:"Extracted path, if specified"`
+	Schema        string          `json:"schema,omitempty" jsonschema:"JSON Schema for values (if include_schema=true and schema exists)"`
+	SchemaWarning string          `json:"schema_warning,omitempty" jsonschema:"Set when include_schema=true but the schema could not be retrieved; absence of this field with empty schema means the chart has no schema"`
+	ParseWarning  string          `json:"parse_warning,omitempty" jsonschema:"Set when the YAML parser failed on this chart's values.yaml. The 'values' field then contains raw bytes (possibly truncated) and path/depth/include_examples/include_schema were not applied"`
+	Examples      []valuesExample `json:"examples,omitempty" jsonschema:"Nearby commented YAML examples, if include_examples=true and examples are found"`
+}
+
+type valuesExample struct {
+	YAML       string `json:"yaml" jsonschema:"Example YAML"`
+	Source     string `json:"source" jsonschema:"Where the example was found"`
+	Confidence string `json:"confidence" jsonschema:"Confidence that the commented block is a usable example"`
 }
 
 type getDependenciesInput struct {
@@ -165,6 +175,10 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		repo := strings.TrimSpace(in.RepositoryURL)
 		chart := strings.TrimSpace(in.ChartName)
 		path := strings.TrimSpace(in.Path)
+		includeExamples := in.IncludeExamples != nil && *in.IncludeExamples
+		if includeExamples && path == "" {
+			return mcputil.TextError("include_examples requires path to keep example discovery scoped"), getValuesOutput{}, nil
+		}
 
 		version, err := h.resolveVersion(ctx, repo, chart, in.ChartVersion)
 		if err != nil {
@@ -201,6 +215,9 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 		if in.MaxArrayItems != nil && *in.MaxArrayItems < 0 {
 			return mcputil.TextError("max_array_items must be >= 0"), getValuesOutput{}, nil
 		}
+		if in.ExampleLimit != nil && *in.ExampleLimit < 0 {
+			return mcputil.TextError("example_limit must be >= 0"), getValuesOutput{}, nil
+		}
 
 		// Build collapse options from input
 		opts := DefaultCollapseOptions()
@@ -217,22 +234,8 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 			opts.ShowDefaults = *in.ShowDefaults
 		}
 
-		// If path is specified, extract that portion first
-		dataToProcess := valuesBytes
-		if path != "" {
-			extracted, extractErr := extractYAMLPath(valuesBytes, path)
-			if extractErr != nil {
-				// Provide actionable error message with chart context
-				if strings.Contains(extractErr.Error(), "path not found") {
-					return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (try depth=1 to see available keys)", path, repo, chart, version)), getValuesOutput{}, nil
-				}
-				return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, extractErr)), getValuesOutput{}, nil
-			}
-			dataToProcess = []byte(extracted)
-		}
-
 		// Fetch schema early so we can account for its size
-		var schemaStr string
+		var schemaStr, schemaWarning string
 		if in.IncludeSchema != nil && *in.IncludeSchema {
 			schema, present, schemaErr := h.svc.GetValuesSchema(ctx, repo, chart, version)
 			if schemaErr != nil {
@@ -242,51 +245,227 @@ func (h *Handler) getValues() mcp.ToolHandlerFor[getValuesInput, getValuesOutput
 					"version":    version,
 					"error":      schemaErr.Error(),
 				})
-				// Don't fail the whole request, schema just won't be included
+				// Surface the failure to the agent so they can distinguish "no
+				// schema available" from "fetch failed" — without failing the
+				// whole request.
+				schemaWarning = fmt.Sprintf("schema fetch failed: %v", schemaErr)
 			} else if present {
 				schemaStr = string(schema)
 			}
 		}
 
 		// Apply collapse transformation, auto-reducing depth if output exceeds limit
-		result, _, err := CollapseYAML(dataToProcess, opts)
+		result, _, err := CollapseYAMLAtPath(valuesBytes, path, opts)
 		if err != nil {
+			// "path not found" is a fully classified error — don't degrade.
+			if strings.Contains(err.Error(), "path not found") {
+				return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (call get_values without 'path' and with depth=1 to see available top-level keys)", path, repo, chart, version)), getValuesOutput{}, nil
+			}
+			// YAML parse failures (e.g. argo-cd's empty literal-block-scalar +
+			// comment pattern hits a goccy/go-yaml bug) used to fail the whole
+			// request. Fall back to returning the raw values so the agent still
+			// gets the chart's data, with a parse_warning explaining why
+			// path/depth/include_examples couldn't be applied.
+			if isYAMLParseError(err) {
+				mcputil.SessionLogError(ctx, req, "YAML parse failed; returning raw values", map[string]any{
+					"repository": repo,
+					"chart":      chart,
+					"version":    version,
+					"path":       path,
+					"error":      err.Error(),
+				})
+				rawValues, parseWarning := fallbackRawValues(valuesBytes, path, len(schemaStr), err)
+				output := getValuesOutput{
+					Version:       version,
+					Values:        rawValues,
+					Path:          path,
+					Schema:        schemaStr,
+					SchemaWarning: schemaWarning,
+					ParseWarning:  parseWarning,
+				}
+				textContent := rawValues
+				if schemaStr != "" {
+					textContent += "\n\n--- schema ---\n" + schemaStr
+				}
+				textContent += "\n\n--- parse_warning ---\n# " + parseWarning
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: textContent}},
+				}, output, nil
+			}
+			if path != "" {
+				return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
+			}
 			return mcputil.TextError(fmt.Sprintf("processing values: %v", err)), getValuesOutput{}, nil
 		}
 
-		for len(result)+len(schemaStr) > MaxResponseBytes && opts.MaxDepth > 1 {
-			opts.MaxDepth--
-			result, _, err = CollapseYAML(dataToProcess, opts)
+		var examples []valuesExample
+		var examplesText string
+		if includeExamples {
+			limit := defaultExampleLimit
+			if in.ExampleLimit != nil && *in.ExampleLimit > 0 {
+				limit = *in.ExampleLimit
+			}
+			if limit > maxExampleLimit {
+				limit = maxExampleLimit
+			}
+			nearby, err := extractNearbyExamples(valuesBytes, path, limit)
 			if err != nil {
+				// Path was already validated by CollapseYAMLAtPath above; any error
+				// here is a YAML parse failure in the example extraction. Log and
+				// continue without examples rather than fail the whole request.
+				mcputil.SessionLogError(ctx, req, "Failed to extract nearby examples", map[string]any{
+					"repository": repo,
+					"chart":      chart,
+					"version":    version,
+					"path":       path,
+					"error":      err.Error(),
+				})
+			} else {
+				examples = make([]valuesExample, 0, len(nearby))
+				for _, example := range nearby {
+					examples = append(examples, valuesExample(example))
+				}
+				examplesText = formatExamplesText(examples)
+			}
+		}
+
+		for len(result)+len(schemaStr)+len(examplesText) > MaxResponseBytes && opts.MaxDepth > 1 {
+			opts.MaxDepth--
+			result, _, err = CollapseYAMLAtPath(valuesBytes, path, opts)
+			if err != nil {
+				if strings.Contains(err.Error(), "path not found") {
+					return mcputil.TextError(fmt.Sprintf("path %q not found in %s/%s@%s values.yaml (call get_values without 'path' and with depth=1 to see available top-level keys)", path, repo, chart, version)), getValuesOutput{}, nil
+				}
+				if path != "" {
+					return mcputil.TextError(fmt.Sprintf("invalid path syntax %q in %s/%s@%s: %v", path, repo, chart, version, err)), getValuesOutput{}, nil
+				}
 				return mcputil.TextError(fmt.Sprintf("processing values: %v", err)), getValuesOutput{}, nil
 			}
 		}
 
-		// If output still exceeds limit at minimum depth, return an actionable error
-		if len(result)+len(schemaStr) > MaxResponseBytes {
+		// If still over budget at minimum depth, drop examples one at a time before
+		// giving up. The user asked for path-scoped values; examples are an extra.
+		for len(result)+len(schemaStr)+len(examplesText) > MaxResponseBytes && len(examples) > 0 {
+			examples = examples[:len(examples)-1]
+			examplesText = formatExamplesText(examples)
+		}
+
+		// If output still exceeds limit, return an actionable error
+		if len(result)+len(schemaStr)+len(examplesText) > MaxResponseBytes {
 			return mcputil.TextError(fmt.Sprintf(
 				"values output too large (%d bytes, limit %d) even at depth=%d; use the 'path' parameter to select a subsection (e.g. path=\".ingress\")",
-				len(result)+len(schemaStr), MaxResponseBytes, opts.MaxDepth,
+				len(result)+len(schemaStr)+len(examplesText), MaxResponseBytes, opts.MaxDepth,
 			)), getValuesOutput{}, nil
 		}
 
 		output := getValuesOutput{
-			Version: version,
-			Values:  result,
-			Path:    path,
-			Schema:  schemaStr,
+			Version:       version,
+			Values:        result,
+			Path:          path,
+			Schema:        schemaStr,
+			SchemaWarning: schemaWarning,
+			Examples:      examples,
 		}
 
 		// Return raw YAML as text so LLMs read it directly, not wrapped in JSON.
 		textContent := result
+		if examplesText != "" {
+			textContent += examplesText
+		}
 		if schemaStr != "" {
 			textContent += "\n\n--- schema ---\n" + schemaStr
+		} else if schemaWarning != "" {
+			textContent += "\n\n--- schema ---\n# " + schemaWarning
 		}
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: textContent}},
 		}, output, nil
 	}
+}
+
+func formatExamplesText(examples []valuesExample) string {
+	if len(examples) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n\n--- examples ---")
+	for i, example := range examples {
+		fmt.Fprintf(&sb, "\n# example %d (%s, %s)\n", i+1, example.Confidence, example.Source)
+		sb.WriteString(strings.TrimSpace(example.YAML))
+		sb.WriteString("\n")
+	}
+	return strings.TrimSuffix(sb.String(), "\n")
+}
+
+// isYAMLParseError tells us whether the error from CollapseYAMLAtPath /
+// CollapseYAML originated in the YAML parser. The wrappers prefix parse
+// failures with "parsing YAML:".
+func isYAMLParseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "parsing YAML")
+}
+
+// fallbackRawValues prepares a raw-values response when the YAML AST parser
+// failed. It returns the raw bytes (truncated at a line boundary within budget
+// headroom) and a one-line warning. path/depth/include_examples cannot be
+// honored without an AST, so the caller should not attempt them when this is
+// invoked.
+func fallbackRawValues(values []byte, path string, schemaSize int, parseErr error) (string, string) {
+	summary := summarizeYAMLParseError(parseErr)
+	var warning string
+	if path != "" {
+		warning = fmt.Sprintf(
+			"YAML parser failed (%s); returning raw values without applying path=%q, depth, include_examples, or include_schema. Search the raw values for the section you need.",
+			summary, path,
+		)
+	} else {
+		warning = fmt.Sprintf(
+			"YAML parser failed (%s); returning raw values without applying depth, include_examples, or include_schema.",
+			summary,
+		)
+	}
+
+	// Reserve room for the warning, schema (if any), and the headers we
+	// concatenate around them. 256 bytes of headroom is enough for the
+	// "--- parse_warning ---" / "--- schema ---" markers.
+	const headerOverhead = 256
+	available := MaxResponseBytes - schemaSize - len(warning) - headerOverhead
+	if available < 0 {
+		available = 0
+	}
+
+	raw := string(values)
+	if len(raw) > available {
+		// Round down to a line boundary so the agent doesn't see a key cut in
+		// half (e.g. "containerPorts.m\n# ...truncated...").
+		cut := available
+		if nl := strings.LastIndexByte(raw[:cut], '\n'); nl > 0 {
+			cut = nl
+		}
+		raw = raw[:cut] + "\n# ...truncated due to response budget; raw output is unparseable so depth/path/example controls do not apply...\n"
+	}
+	return raw, warning
+}
+
+// summarizeYAMLParseError reduces a goccy/go-yaml parse error to a single
+// line. The default formatting includes a multi-line code frame with line
+// numbers and a caret, which is useful in a developer log but noisy in a
+// machine-readable response field.
+func summarizeYAMLParseError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	// The first line typically reads: "parsing YAML: [LINE:COL] description"
+	// followed by the code frame. Drop everything after the first newline.
+	if nl := strings.IndexByte(msg, '\n'); nl > 0 {
+		msg = msg[:nl]
+	}
+	return strings.TrimSpace(msg)
 }
 
 func (h *Handler) getDependencies() mcp.ToolHandlerFor[getDependenciesInput, getDependenciesOutput] {
@@ -361,8 +540,8 @@ func (h *Handler) getNotes() mcp.ToolHandlerFor[getNotesInput, getNotesOutput] {
 		// Guard against responses that would overwhelm LLM context
 		if len(notes) > MaxResponseBytes {
 			return mcputil.TextError(fmt.Sprintf(
-				"NOTES.txt too large (%d bytes, limit %d)",
-				len(notes), MaxResponseBytes,
+				"NOTES.txt for %s/%s@%s is too large (%d bytes, limit %d). NOTES.txt is rendered as a single document and has no subsection parameter — fetch the chart locally with `helm pull` if you need the full content.",
+				repo, chart, version, len(notes), MaxResponseBytes,
 			)), getNotesOutput{}, nil
 		}
 
@@ -371,45 +550,4 @@ func (h *Handler) getNotes() mcp.ToolHandlerFor[getNotesInput, getNotesOutput] {
 			Notes:   string(notes),
 		}, nil
 	}
-}
-
-// Helper functions
-
-// extractYAMLPath extracts a value at the given yq-style path from YAML data.
-// Supports paths like ".foo.bar" or ".foo.bar[0]"
-func extractYAMLPath(data []byte, path string) (string, error) {
-	// Handle empty path - return whole document
-	path = strings.TrimPrefix(path, ".")
-	if path == "" {
-		var v any
-		if err := yaml.Unmarshal(data, &v); err != nil {
-			return "", fmt.Errorf("failed to parse YAML: %w", err)
-		}
-		out, err := yaml.Marshal(v)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal result: %w", err)
-		}
-		return strings.TrimSpace(string(out)), nil
-	}
-
-	// Convert yq-style path (.foo.bar[0]) to YAMLPath syntax ($.foo.bar[0])
-	yamlPath := "$." + path
-
-	yp, err := yaml.PathString(yamlPath)
-	if err != nil {
-		return "", fmt.Errorf("invalid path %q: %w", path, err)
-	}
-
-	var result any
-	if err := yp.Read(strings.NewReader(string(data)), &result); err != nil {
-		return "", fmt.Errorf("path not found: %q", path)
-	}
-
-	// Marshal the result back to YAML
-	out, err := yaml.Marshal(result)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal result: %w", err)
-	}
-
-	return strings.TrimSpace(string(out)), nil
 }

@@ -17,7 +17,10 @@ func TestChartNotFoundError(t *testing.T) {
 
 		assert.Contains(t, err.Error(), "nginx")
 		assert.Contains(t, err.Error(), "1.0.0")
-		assert.Contains(t, err.Error(), "https://repo.com")
+		// Repo intentionally not included in the formatted message; the
+		// outer mcputil.OperationError wrapper carries it. Programmatic
+		// consumers can read err.Repository directly via errors.As.
+		assert.NotContains(t, err.Error(), "https://repo.com")
 	})
 
 	t.Run("error message without version", func(t *testing.T) {
@@ -27,8 +30,20 @@ func TestChartNotFoundError(t *testing.T) {
 		}
 
 		assert.Contains(t, err.Error(), "nginx")
-		assert.Contains(t, err.Error(), "https://repo.com")
+		assert.NotContains(t, err.Error(), "https://repo.com")
 		assert.NotContains(t, err.Error(), "version")
+	})
+
+	t.Run("Repository field still accessible programmatically", func(t *testing.T) {
+		err := &ChartNotFoundError{
+			Repository: "https://repo.com",
+			Chart:      "nginx",
+		}
+
+		var cnfe *ChartNotFoundError
+		require := assert.New(t)
+		require.True(errors.As(err, &cnfe))
+		require.Equal("https://repo.com", cnfe.Repository)
 	})
 
 	t.Run("Is matches sentinel ErrChartNotFound", func(t *testing.T) {
@@ -61,7 +76,9 @@ func TestRepositoryError(t *testing.T) {
 		}
 
 		msg := err.Error()
-		assert.Contains(t, msg, "https://bad.repo")
+		// URL intentionally not included; the outer mcputil.OperationError
+		// wrapper carries it. URL field remains for programmatic access.
+		assert.NotContains(t, msg, "https://bad.repo")
 		assert.Contains(t, msg, "fetch")
 		assert.Contains(t, msg, "failed to download index")
 		assert.Contains(t, msg, "connection refused")
@@ -75,8 +92,21 @@ func TestRepositoryError(t *testing.T) {
 		}
 
 		msg := err.Error()
-		assert.Contains(t, msg, "https://bad.repo")
+		assert.NotContains(t, msg, "https://bad.repo")
+		assert.Contains(t, msg, "fetch")
 		assert.Contains(t, msg, "no URLs available")
+	})
+
+	t.Run("URL field still accessible programmatically", func(t *testing.T) {
+		err := &RepositoryError{
+			URL:     "https://bad.repo",
+			Op:      "fetch",
+			Message: "no URLs available",
+		}
+
+		var re *RepositoryError
+		assert.True(t, errors.As(err, &re))
+		assert.Equal(t, "https://bad.repo", re.URL)
 	})
 
 	t.Run("Unwrap returns inner error", func(t *testing.T) {
@@ -132,8 +162,21 @@ func TestURLValidationError(t *testing.T) {
 			Reason: "scheme must be http or https",
 		}
 
-		assert.Contains(t, err.Error(), "ftp://invalid.url")
+		// URL intentionally omitted from the formatted message; the outer
+		// mcputil.OperationError wrapper carries it.
+		assert.NotContains(t, err.Error(), "ftp://invalid.url")
 		assert.Contains(t, err.Error(), "scheme must be http or https")
+	})
+
+	t.Run("URL field still accessible programmatically", func(t *testing.T) {
+		err := &URLValidationError{
+			URL:    "ftp://invalid.url",
+			Reason: "scheme must be http or https",
+		}
+
+		var ue *URLValidationError
+		assert.True(t, errors.As(err, &ue))
+		assert.Equal(t, "ftp://invalid.url", ue.URL)
 	})
 
 	t.Run("Is matches sentinel ErrInvalidURL", func(t *testing.T) {
