@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.6](https://github.com/kubedoll-heavy-industries/helm-mcp/compare/v0.1.5...v0.1.6) (2026-05-08)
+
+
+### Bug Fixes
+
+* **ci:** Bump actions/setup-node from 6.3.0 to 6.4.0 ([#63](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/63)) ([364b6a4](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/364b6a4821cfd5c2005ad73ed53e1a17b7930894))
+* **ci:** Bump aquasecurity/trivy-action ([#61](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/61)) ([2b6637b](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/2b6637b4b91d51dfd5d78a57bfc1ef8f86d5a01f))
+* **ci:** Bump googleapis/release-please-action ([#56](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/56)) ([18576ce](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/18576ce2cf8214869a84d8d318910dc564eb109e))
+* **ci:** Bump goreleaser/goreleaser-action from 7.1.0 to 7.2.1 ([#59](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/59)) ([922323e](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/922323ecb69d66b8a15bf70388a9ee41e5feb029))
+* **ci:** Bump ossf/scorecard-action ([#57](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/57)) ([c3e4bf6](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/c3e4bf6c1c74ed3b84fd69d9ce2d31f81dbc62d7))
+* **ci:** use commit SHA for codeql-action pin (was tag object SHA) ([#69](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/69)) ([53524cf](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/53524cf30c10437c619d12ed4769a79a485af6c3))
+* **deps:** Bump github.com/Masterminds/semver/v3 from 3.4.0 to 3.5.0 ([#60](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/60)) ([8a9c024](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/8a9c024617209817d54d80ab83127da18895be27))
+* **deps:** Bump github.com/modelcontextprotocol/go-sdk ([#58](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/58)) ([574ae78](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/574ae7870169404d3399d8f262b8b3cc0c51da20))
+* **deps:** Bump go.uber.org/zap from 1.27.1 to 1.28.0 ([#62](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/62)) ([fd8651a](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/fd8651a88b56dee86c972186962656f168c6452a))
+* **devcontainer:** Bump ghcr.io/devcontainers/features/node ([#55](https://github.com/kubedoll-heavy-industries/helm-mcp/issues/55)) ([6b0528d](https://github.com/kubedoll-heavy-industries/helm-mcp/commit/6b0528df23aaf00318d4842dc77ea8b80aea353e))
+
 ## [0.1.5](https://github.com/kubedoll-heavy-industries/helm-mcp/compare/v0.1.4...v0.1.5) (2026-04-30)
 
 
