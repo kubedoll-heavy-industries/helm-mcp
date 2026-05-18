@@ -16,8 +16,8 @@ ARG SOURCE=https://github.com/kubedoll-heavy-industries/helm-mcp
 ARG TARGETARCH=amd64
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
-  CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
-  go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
+  CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} GOMAXPROCS=2 \
+  go build -p=1 -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
   -o /out/mcp-helm ./cmd/mcp-helm
 
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime

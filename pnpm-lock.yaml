@@ -1,0 +1,31 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@cloudflare/containers':
+        specifier: ^0.1.1
+        version: 0.1.1
+    devDependencies:
+      '@cloudflare/workers-types':
+        specifier: ^4.20260228.1
+        version: 4.20260517.1
+
+packages:
+
+  '@cloudflare/containers@0.1.1':
+    resolution: {integrity: sha512-YTdobRTnTlUOUPMFemufH367A9Z8pDfZ+UboYMLbGpO0VlvEXZDiioSmXPQMHld2vRtkL31mcRii3bcbQU6fdw==}
+
+  '@cloudflare/workers-types@4.20260517.1':
+    resolution: {integrity: sha512-OjavgX6VpYoWlKg2xPgLKIhBeiJvNdwFVK8E1P6hF02wh1oEt1sZpTzbp9kdohprqjXo6UVqs7/AuIH0wxIcbw==}
+
+snapshots:
+
+  '@cloudflare/containers@0.1.1': {}
+
+  '@cloudflare/workers-types@4.20260517.1': {}

@@ -8,12 +8,20 @@
 
 /tmp
 /tmp/**
+tmp/
+tmp/**
 
 **/*_test.go
 
 dist
 
 node_modules
+e2e-ts/
+mcp-helm
+coverage.out
+*.svg
+*.png
+pnpm-lock.yaml
 
 *.log
 build-errors.log
