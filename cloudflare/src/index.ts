@@ -1,4 +1,6 @@
-import { Container, getContainer } from "@cloudflare/containers";
+import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
+
+export { ContainerProxy };
 
 interface Env {
   MCP_HELM: DurableObjectNamespace<McpHelmContainer>;
@@ -6,6 +8,7 @@ interface Env {
 
 export class McpHelmContainer extends Container {
   defaultPort = 8012;
+  enableInternet = true;
   sleepAfter = "5m";
 }
 
