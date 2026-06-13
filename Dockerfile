@@ -45,7 +45,7 @@ USER nonroot
 ENTRYPOINT ["/mcp-helm"]
 CMD ["--listen=:8012", "--transport=http"]
 
-FROM alpine:3.23.4 AS debug
+FROM alpine:3.24.0 AS debug
 
 RUN apk add --no-cache ca-certificates tzdata curl
 
