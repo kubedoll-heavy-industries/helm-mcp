@@ -1,6 +1,6 @@
 {
   "name": "mcp-helm",
-  "image": "mcr.microsoft.com/devcontainers/go:1.25-trixie",
+  "image": "mcr.microsoft.com/devcontainers/go:1.26-trixie",
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {
       "username": "vscode"

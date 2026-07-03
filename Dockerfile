@@ -1,4 +1,4 @@
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.26.4
 
 FROM golang:${GO_VERSION}-trixie AS build
 
@@ -42,6 +42,8 @@ COPY --from=build /out/mcp-helm /mcp-helm
 
 USER nonroot
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["/mcp-helm", "healthcheck"]
+
 ENTRYPOINT ["/mcp-helm"]
 CMD ["--listen=:8012", "--transport=http"]
 
@@ -54,6 +56,8 @@ EXPOSE 8012
 COPY --from=build /out/mcp-helm /mcp-helm
 
 USER nobody
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["/mcp-helm", "healthcheck"]
 
 ENTRYPOINT ["/mcp-helm"]
 CMD ["--listen=:8012", "--transport=http"]

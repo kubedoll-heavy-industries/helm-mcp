@@ -2,9 +2,9 @@
   "name": "mcp-helm-cloudflare",
   "private": true,
   "dependencies": {
-    "@cloudflare/containers": "^0.1.1"
+    "@cloudflare/containers": "^0.3.7"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260228.1"
+    "@cloudflare/workers-types": "^5.20260703.1"
   }
 }
