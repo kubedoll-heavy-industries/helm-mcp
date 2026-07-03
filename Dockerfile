@@ -47,7 +47,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["/mcp
 ENTRYPOINT ["/mcp-helm"]
 CMD ["--listen=:8012", "--transport=http"]
 
-FROM alpine:3.23.4 AS debug
+FROM alpine:3.24.1 AS debug
 
 RUN apk add --no-cache ca-certificates tzdata curl
 
