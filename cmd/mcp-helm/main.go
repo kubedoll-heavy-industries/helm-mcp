@@ -4,9 +4,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.uber.org/zap"
@@ -25,6 +27,8 @@ var (
 	date    = "unknown"
 )
 
+const defaultHealthcheckURL = "http://127.0.0.1:8012/healthz"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -33,6 +37,10 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		return runHealthcheck()
+	}
+
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
@@ -93,6 +101,25 @@ func run() error {
 	defer cancel()
 
 	return srv.Run(ctx)
+}
+
+func runHealthcheck() error {
+	url := os.Getenv("MCP_HELM_HEALTHCHECK_URL")
+	if url == "" {
+		url = defaultHealthcheckURL
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("healthcheck request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("healthcheck failed: %s", resp.Status)
+	}
+	return nil
 }
 
 // newLogger creates a zap logger with the specified level and format.

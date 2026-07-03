@@ -22,7 +22,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
-          go-version: '1.26.3'
+          go-version: '1.26.4'
           cache: true
 
       - name: Install govulncheck
@@ -52,8 +52,10 @@ jobs:
           skip-setup-trivy: 'true'
           scan-type: 'fs'
           scan-ref: '.'
+          skip-dirs: 'e2e-ts/node_modules,node_modules'
+          trivyignores: '.trivyignore'
           severity: 'CRITICAL,HIGH'
-          exit-code: '0'  # Don't fail the build, just report
+          exit-code: '1'
           format: 'sarif'
           output: 'trivy-results.sarif'
 
@@ -84,7 +86,9 @@ jobs:
           skip-setup-trivy: 'true'
           scan-type: 'config'
           scan-ref: '.'
-          exit-code: '0'  # Don't fail the build, just report
+          skip-dirs: 'e2e-ts/node_modules,node_modules'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
           format: 'sarif'
           output: 'trivy-config-results.sarif'
 
@@ -93,6 +97,36 @@ jobs:
         if: always()
         with:
           sarif_file: 'trivy-config-results.sarif'
+
+  npm-audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            e2e-ts/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Audit root dependencies
+        run: npm audit
+
+      - name: Install E2E dependencies
+        working-directory: e2e-ts
+        run: npm ci
+
+      - name: Audit E2E dependencies
+        working-directory: e2e-ts
+        run: npm audit
 
   dependency-review:
     name: dependency-review
@@ -109,4 +143,8 @@ jobs:
         uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
         with:
           fail-on-severity: high
+          # Helm v4.2.2 currently pulls oras-go/v2, and GHSA-fxhp-mv3v-67qp
+          # has no v2 patched release. Keep dependency-review blocking for other
+          # high-severity advisories while tracking this exception in issue #95.
+          allow-ghsas: GHSA-fxhp-mv3v-67qp
           comment-summary-in-pr: always

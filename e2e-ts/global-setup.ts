@@ -1,7 +1,12 @@
 import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { GenericContainer, Wait } from "testcontainers";
 import type { StartedTestContainer } from "testcontainers";
 import type { GlobalSetupContext } from "vitest/node";
+
+const execFileAsync = promisify(execFile);
+const imageName = "mcp-helm-e2e:latest";
 
 declare module "vitest" {
   export interface ProvidedContext {
@@ -12,13 +17,12 @@ declare module "vitest" {
 let container: StartedTestContainer;
 
 export async function setup({ provide }: GlobalSetupContext) {
-  const image = await GenericContainer.fromDockerfile(
-    path.resolve(import.meta.dirname, ".."),
-  )
-    .withBuildkit()
-    .build("mcp-helm-e2e:latest", { deleteOnExit: false });
+  const context = path.resolve(import.meta.dirname, "..");
+  await execFileAsync("docker", ["build", "-t", imageName, context], {
+    maxBuffer: 10 * 1024 * 1024,
+  });
 
-  container = await image
+  container = await new GenericContainer(imageName)
     .withExposedPorts(8012)
     .withWaitStrategy(
       Wait.forHttp("/healthz", 8012).forStatusCode(200),

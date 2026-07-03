@@ -1,4 +1,4 @@
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.26.4
 
 FROM golang:${GO_VERSION}-trixie AS build
 
@@ -16,8 +16,8 @@ ARG SOURCE=https://github.com/kubedoll-heavy-industries/helm-mcp
 ARG TARGETARCH=amd64
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
-  CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
-  go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
+  CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} GOMAXPROCS=2 \
+  go build -p=1 -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
   -o /out/mcp-helm ./cmd/mcp-helm
 
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
@@ -42,6 +42,8 @@ COPY --from=build /out/mcp-helm /mcp-helm
 
 USER nonroot
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["/mcp-helm", "healthcheck"]
+
 ENTRYPOINT ["/mcp-helm"]
 CMD ["--listen=:8012", "--transport=http"]
 
@@ -54,6 +56,8 @@ EXPOSE 8012
 COPY --from=build /out/mcp-helm /mcp-helm
 
 USER nobody
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["/mcp-helm", "healthcheck"]
 
 ENTRYPOINT ["/mcp-helm"]
 CMD ["--listen=:8012", "--transport=http"]
